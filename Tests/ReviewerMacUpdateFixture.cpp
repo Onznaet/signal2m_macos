@@ -2,7 +2,7 @@
 // The loader itself does not link JUCE, Signal2M, or Objective-C transport code.
 #include "UpdateChecker.h"
 #include <dlfcn.h>
-#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <cstdint>
 #include <utility>
 
@@ -73,8 +73,10 @@ REVIEWER_EXPORT void ReviewerMacGetDiagnostics(std::uint64_t* contexts, std::uin
 REVIEWER_EXPORT bool ReviewerMacTransportIsDynamicImage() noexcept
 {
     Dl_info information{};
-    return dladdr(reinterpret_cast<const void*>(&signal2m::update_detail::fetchHttp), &information) != 0
-        && information.dli_fbase != static_cast<const void*>(_NSGetMachExecuteHeader());
+    if (dladdr(reinterpret_cast<const void*>(&signal2m::update_detail::fetchHttp), &information) == 0
+        || information.dli_fbase == nullptr) return false;
+    const auto* header = static_cast<const mach_header*>(information.dli_fbase);
+    return header->filetype == MH_DYLIB || header->filetype == MH_BUNDLE;
 }
 
 REVIEWER_EXPORT void ReviewerMacForceNextFallback() noexcept
