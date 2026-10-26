@@ -1,0 +1,17 @@
+/.tools/
+/dependencies/
+/build*/
+/dist*/
+/output/
+/references/
+/.codex/
+/.agents/
+/.aws/
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+*.p12
+*.p8
+*.mobileprovision
