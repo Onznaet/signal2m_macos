@@ -42,6 +42,12 @@ std::atomic<void*> permanentImagePin { nullptr };
 std::atomic<bool> teardownUnavailable { false };
 std::atomic<std::uint64_t> activeContexts { 0 }, activeCallbacks { 0 }, teardownFallbacks { 0 };
 std::atomic<std::uint64_t> temporaryImagePins { 0 }, delegateClasses { 0 };
+// Read-only diagnostics for native tests: no URL, headers, or response bytes.
+// Bits: attempted, session, invalidated, queue-empty, callbacks-zero,
+// session-gone, queue-gone, delegate-gone, network-success, quiescent,
+// forced-fallback, worker-delegate-released.
+std::atomic<std::uint32_t> lastTeardownFlags { 0 };
+std::atomic<const char*> lastNetworkStage { "not-started" };
 #if defined(SIGNAL2M_MAC_TRANSPORT_TEST_HOOKS)
 std::atomic<bool> forceNextTeardownFallback { false };
 #endif
@@ -467,6 +473,7 @@ FetchResponse fetchHttp(const juce::String& endpoint, RequestControl& control)
     __weak NSURLSession* weakSession = nil;
     __weak NSOperationQueue* weakQueue = nil;
     bool attemptedSession = false, hadSession = false, invalidatedAndDrained = false;
+    bool queueEmpty = false, networkSucceeded = false, delegateReleased = false, forcedFallback = false;
     Clock::time_point cleanupEnd;
 
     @autoreleasepool
@@ -534,6 +541,11 @@ FetchResponse fetchHttp(const juce::String& endpoint, RequestControl& control)
         // Cancel is asynchronous, so retain our code and heap context until the
         // invalidation callback has returned AND its serial queue has drained.
         state->stop.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            networkSucceeded = state->response.success;
+            lastNetworkStage.store(state->stage, std::memory_order_release);
+        }
         cleanupEnd = Clock::now() + cleanupBudget;
         @try
         {
@@ -542,7 +554,8 @@ FetchResponse fetchHttp(const juce::String& endpoint, RequestControl& control)
             {
                 bool invalidated = false;
                 { std::lock_guard<std::mutex> lock(state->mutex); invalidated = state->invalidated; }
-                if (invalidated && state->callbacks.load(std::memory_order_acquire) == 0 && [queue operationCount] == 0)
+                queueEmpty = [queue operationCount] == 0;
+                if (invalidated && state->callbacks.load(std::memory_order_acquire) == 0 && queueEmpty)
                 { invalidatedAndDrained = true; break; }
                 std::this_thread::sleep_for(1ms);
             }
@@ -553,31 +566,34 @@ FetchResponse fetchHttp(const juce::String& endpoint, RequestControl& control)
         queue = nil;
     } // Drain task/session/queue autoreleases while our delegate is still owned.
 
-    bool nativeObjectsGone = !attemptedSession;
-    while (invalidatedAndDrained && Clock::now() < cleanupEnd)
-    {
-        @autoreleasepool { nativeObjectsGone = weakSession == nil && weakQueue == nil; }
-        if (nativeObjectsGone) break;
-        std::this_thread::sleep_for(1ms);
-    }
-    bool quiescent = !attemptedSession || (hadSession && invalidatedAndDrained && nativeObjectsGone
+    // Invalidation breaks native references to our delegate/callback objects;
+    // it does not promise deallocation of NSURLSession or NSOperationQueue.
+    // Foundation may retain those system objects after our callbacks are gone.
+    // Observe them for diagnostics, and prove unload safety with the terminal
+    // invalidation callback, drained serial queue, and destroyed delegate.
+    // https://developer.apple.com/documentation/foundation/urlsession/invalidateandcancel()
+    bool sessionGone = false, queueGone = false;
+    @autoreleasepool { sessionGone = weakSession == nil; queueGone = weakQueue == nil; }
+    bool quiescent = !attemptedSession || (hadSession && invalidatedAndDrained
                             && state->callbacks.load(std::memory_order_acquire) == 0);
 #if defined(SIGNAL2M_MAC_TRANSPORT_TEST_HOOKS)
     // Fault injection belongs exclusively to the independent test dylib. It
     // takes the real pin/quarantine/circuit-breaker path, and cannot reset it.
-    if (forceNextTeardownFallback.exchange(false, std::memory_order_acq_rel)) quiescent = false;
+    forcedFallback = forceNextTeardownFallback.exchange(false, std::memory_order_acq_rel);
+    if (forcedFallback) quiescent = false;
 #endif
     if (quiescent)
     {
-        // There is no native queue/session able to invoke us, and the remaining
-        // delegate owner is this worker. Detach before the worker releases it.
-        if (delegate != nil) *contextSlot(delegate) = nullptr;
+        // Invalidation is terminal and all queued callbacks have returned.
+        // Keep the heap context valid through the delegate's final release;
+        // free it only after no strong native callback holder owns the object.
         delegate = nil;
-        @autoreleasepool
+        delegateReleased = true;
+        for (;;)
         {
-            id stillAlive = weakDelegate;
-            quiescent = stillAlive == nil;
-            if (!quiescent) *contextSlot(stillAlive) = state.get();
+            @autoreleasepool { quiescent = weakDelegate == nil; }
+            if (quiescent || Clock::now() >= cleanupEnd) break;
+            std::this_thread::sleep_for(1ms);
         }
         if (quiescent && delegateClass != Nil) { objc_disposeClassPair(delegateClass); --delegateClasses; }
     }
@@ -592,6 +608,16 @@ FetchResponse fetchHttp(const juce::String& endpoint, RequestControl& control)
         { std::lock_guard<std::mutex> lock(state->mutex); state->response.success = false; state->stage = "native-teardown-timeout"; }
         delegate = nil;
     }
+
+    std::uint32_t flags = (attemptedSession ? 1U : 0U) | (hadSession ? 2U : 0U)
+                        | (queueEmpty ? 8U : 0U) | (sessionGone ? 32U : 0U)
+                        | (queueGone ? 64U : 0U) | (networkSucceeded ? 256U : 0U)
+                        | (quiescent ? 512U : 0U) | (forcedFallback ? 1024U : 0U)
+                        | (delegateReleased ? 2048U : 0U);
+    { std::lock_guard<std::mutex> lock(state->mutex); if (state->invalidated) flags |= 4U; }
+    if (state->callbacks.load(std::memory_order_acquire) == 0) flags |= 16U;
+    @autoreleasepool { if (weakDelegate == nil) flags |= 128U; }
+    lastTeardownFlags.store(flags, std::memory_order_release);
 
     // Quarantine BEFORE any result-string allocation that could throw. This
     // context must remain alive even if copying diagnostics fails under OOM.
@@ -613,6 +639,8 @@ std::uint64_t macUpdateTeardownFallbacks() noexcept { return mac_transport::tear
 bool macUpdateImagePermanentlyPinned() noexcept { return mac_transport::permanentImagePin.load() != nullptr; }
 std::uint64_t macUpdateTemporaryImagePins() noexcept { return mac_transport::temporaryImagePins.load(); }
 std::uint64_t macUpdateDelegateClasses() noexcept { return mac_transport::delegateClasses.load(); }
+std::uint32_t macUpdateLastTeardownFlags() noexcept { return mac_transport::lastTeardownFlags.load(std::memory_order_acquire); }
+const char* macUpdateLastNetworkStage() noexcept { return mac_transport::lastNetworkStage.load(std::memory_order_acquire); }
 #if defined(SIGNAL2M_MAC_TRANSPORT_TEST_HOOKS)
 void macUpdateForceNextTeardownFallbackForTest() noexcept { mac_transport::forceNextTeardownFallback.store(true, std::memory_order_release); }
 #endif
