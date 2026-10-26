@@ -29,6 +29,8 @@ std::uint64_t macUpdateTeardownFallbacks() noexcept;
 bool macUpdateImagePermanentlyPinned() noexcept;
 std::uint64_t macUpdateTemporaryImagePins() noexcept;
 std::uint64_t macUpdateDelegateClasses() noexcept;
+std::uint32_t macUpdateLastTeardownFlags() noexcept;
+const char* macUpdateLastNetworkStage() noexcept;
 }
 
 namespace
@@ -170,8 +172,32 @@ private:
     std::vector<std::thread> clients;
 };
 
+void diagnostics(const detail::FetchResponse* response = nullptr)
+{
+    const auto flags = detail::macUpdateLastTeardownFlags();
+    std::cerr << "TRANSPORT networkStage=" << detail::macUpdateLastNetworkStage()
+              << " attempted=" << ((flags & 1U) != 0) << " session=" << ((flags & 2U) != 0)
+              << " invalidated=" << ((flags & 4U) != 0) << " queueEmpty=" << ((flags & 8U) != 0)
+              << " callbacksZero=" << ((flags & 16U) != 0)
+              << " sessionGone=" << ((flags & 32U) != 0) << " queueGone=" << ((flags & 64U) != 0)
+              << " delegateGone=" << ((flags & 128U) != 0) << " networkSuccess=" << ((flags & 256U) != 0)
+              << " quiescent=" << ((flags & 512U) != 0) << " forced=" << ((flags & 1024U) != 0)
+              << " delegateReleased=" << ((flags & 2048U) != 0)
+              << " contexts=" << detail::macUpdateActiveContexts() << " callbacks=" << detail::macUpdateActiveCallbacks()
+              << " classes=" << detail::macUpdateDelegateClasses() << " temporaryPins=" << detail::macUpdateTemporaryImagePins()
+              << " fallbacks=" << detail::macUpdateTeardownFallbacks();
+    if (response != nullptr)
+        std::cerr << " resultStage=" << response->stage << " success=" << response->success
+                  << " status=" << response->statusCode << " bytes=" << response->body.size()
+                  << " nativeError=" << response->nativeError;
+    std::cerr << '\n';
+}
+
 void requireQuiescent()
 {
+    if (detail::macUpdateActiveContexts() != 0 || detail::macUpdateActiveCallbacks() != 0
+        || detail::macUpdateTeardownFallbacks() != 0 || detail::macUpdateImagePermanentlyPinned()
+        || detail::macUpdateTemporaryImagePins() != 0 || detail::macUpdateDelegateClasses() != 0) diagnostics();
     require(detail::macUpdateActiveContexts() == 0, "A native callback context survived a normal fetch return");
     require(detail::macUpdateActiveCallbacks() == 0, "A native callback survived fetch return");
     require(detail::macUpdateTeardownFallbacks() == 0, "Normal native teardown unexpectedly required quarantine");
@@ -184,6 +210,7 @@ detail::FetchResponse fetch(const juce::String& endpoint, std::chrono::milliseco
 {
     detail::RequestControl control(Clock::now() + budget);
     auto response = detail::fetchHttp(endpoint, control);
+    if (!response.success) diagnostics(&response);
     requireQuiescent();
     return response;
 }
@@ -195,6 +222,7 @@ void privacyAndRepeatedQuiescence()
     {
         const auto response = fetch(fixture.url());
         require(response.success && response.statusCode == 200 && response.stage == "complete", "Repeated native HTTP fixture fetch must complete");
+        if (i == 0) diagnostics(&response);
     }
     const auto cookies = fetch(fixture.url("/cookie"));
     require(cookies.success && fixture.cookieTargets == 1, "Cookie-setting redirect must be followed anonymously");
