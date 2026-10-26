@@ -256,8 +256,15 @@ struct Module
             expect(information(CFSTR("CFBundleVersion")) == "0.3.1", "bundle build version is 0.3.1");
             CFHandle<CFURLRef> executable(CFBundleCopyExecutableURL(bundle.get()));
             require(executable.get() != nullptr, "CoreFoundation locates native executable");
-            CFHandle<CFStringRef> executablePath(CFURLCopyFileSystemPath(executable.get(), kCFURLPOSIXPathStyle));
-            require(executablePath.get() && std::filesystem::equivalent(std::filesystem::u8path(cfText(executablePath.get())),
+            // The executable URL may be a filename relative to a base URL.
+            // CFURLCopyFileSystemPath alone does not resolve that base.
+            CFHandle<CFURLRef> absoluteExecutable(CFURLCopyAbsoluteURL(executable.get()));
+            require(absoluteExecutable.get() != nullptr, "resolve native executable URL against its base");
+            CFHandle<CFStringRef> executablePath(CFURLCopyFileSystemPath(absoluteExecutable.get(), kCFURLPOSIXPathStyle));
+            require(executablePath.get() != nullptr, "copy resolved native executable POSIX path");
+            const auto resolvedExecutable = std::filesystem::u8path(cfText(executablePath.get()));
+            require(resolvedExecutable.is_absolute(), "CFBundle executable path is absolute: " + resolvedExecutable.u8string());
+            require(std::filesystem::equivalent(resolvedExecutable,
                     path / "Contents" / "MacOS" / "Signal2M"), "CFBundle executable resolves inside the supplied bundle");
             CFErrorRef rawError = nullptr;
             const bool loaded = CFBundleLoadExecutableAndReturnError(bundle.get(), &rawError);
