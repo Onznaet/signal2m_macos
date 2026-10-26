@@ -1,0 +1,21 @@
+--- a/modules/juce_core/system/juce_StandardHeader.h
++++ b/modules/juce_core/system/juce_StandardHeader.h
+@@ -70,6 +70,7 @@
+ #include <string_view>
+ #include <thread>
+ #include <typeindex>
++#include <type_traits>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+--- a/modules/juce_audio_processors/processors/juce_AudioPluginInstance.h
++++ b/modules/juce_audio_processors/processors/juce_AudioPluginInstance.h
+@@ -161,7 +161,7 @@
+     AudioPluginInstance() = default;
+     AudioPluginInstance (const BusesProperties& ioLayouts) : AudioProcessor (ioLayouts) {}
+     template <size_t numLayouts>
+-    AudioPluginInstance (const short channelLayoutList[numLayouts][2]) : AudioProcessor (channelLayoutList) {}
++    AudioPluginInstance (const short (&channelLayoutList)[numLayouts][2]) : AudioProcessor (channelLayoutList) {}
+ 
+ private:
+     // It's not safe to add a plain AudioProcessorParameter to an AudioPluginInstance.
