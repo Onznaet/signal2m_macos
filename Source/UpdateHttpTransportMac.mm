@@ -10,7 +10,7 @@
 #import <Security/SecProtocolTypes.h>
 #include <dlfcn.h>
 #import <objc/runtime.h>
-#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 
 #include <algorithm>
 #include <atomic>
@@ -186,7 +186,9 @@ public:
         if (dladdr(reinterpret_cast<const void*>(&imageAnchor), &info) == 0) return false;
         // A headless test may statically link this file into its main executable,
         // which cannot be unloaded and cannot be opened as a dylib with dlopen.
-        if (info.dli_fbase == static_cast<const void*>(_NSGetMachExecuteHeader())) return true;
+        const auto* header = static_cast<const mach_header*>(info.dli_fbase);
+        if (header == nullptr) return false;
+        if (header->filetype == MH_EXECUTE) return true;
         if (info.dli_fname == nullptr) return false;
         handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
         if (handle != nullptr) ++temporaryImagePins;
