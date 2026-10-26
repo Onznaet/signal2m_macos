@@ -98,10 +98,14 @@ bash tools/build_macos.sh --sign-identity 'Developer ID Application: YOUR NAME (
 
 Готовый bundle устанавливается вручную по `docs/INSTALL_MACOS_RU.txt`. Внешний вид, открытие/закрытие окна, автоматизация и воспроизведение старого проекта проверяются в настоящей DAW после технических тестов.
 
-## Локально подготовленный CI
+## GitHub Actions
 
-`.github/workflows/macos.yml` — ручной workflow с двумя отдельными runner: `macos-15-intel` (x86_64) и `macos-15` (arm64). Оба собирают Universal и запускают соответствующий нативный срез тестов. Имена runner сверены с [официальной таблицей GitHub](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). Workflow сохранён в проекте; его запись не означает push или запуск GitHub Actions. Публикация artifacts по умолчанию выключена и включается только явным input при ручном запуске.
+.github/workflows/macos.yml — ручной workflow с двумя отдельными runner: macos-15-intel (x86_64) и macos-15 (arm64). Оба собирают Universal и запускают соответствующий нативный срез тестов. Имена runner сверены с [официальной таблицей GitHub](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). [Run5 — 40419330616](https://github.com/Onznaet/signal2m_macos/actions/runs/40419330616) завершился успешно на обоих runner; каждый прошёл 9/9 CTest и полный этап упаковки. Сохранение artifacts включено по умолчанию через input upload_artifacts; срок хранения — 7 дней. Каждый job тестирует собственную Universal-сборку, поэтому хеши двух архивов различаются.
 
 Основные источники рецепта: [CMake 3.31: архитектуры](https://cmake.org/cmake/help/v3.31/variable/CMAKE_OSX_ARCHITECTURES.html), [CMake 3.31: deployment target](https://cmake.org/cmake/help/v3.31/variable/CMAKE_OSX_DEPLOYMENT_TARGET.html), [Apple: Code Signing In Depth](https://developer.apple.com/library/archive/technotes/tn2206/_index.html) и закреплённые локальные CMake-файлы JUCE. Параметры Apple toolchain задаются до `project()` согласно документации CMake.
 
-В текущей Windows-среде нет macOS SDK, Xcode и инструментов `codesign`/`ditto`. Проверки Python и Windows-регрессия доступны здесь; фактический Mach-O, нативные тесты, подпись и ZIP будут созданы только при успешном запуске на Mac. До такого запуска их статус — **не выполнено**.
+Нативная сборка, тесты и упаковка подтверждены в [run5](https://github.com/Onznaet/signal2m_macos/actions/runs/40419330616) из commit c3dc36f91ade3c6e5194ffceccd5a009faeab2ae: arm64 и x86_64 прошли по **9/9 CTest**, ad-hoc подпись, проверку ZIP и загрузку извлечённого VST3 независимым native host. Это реальные прогоны на macOS 15; локальная Windows-среда использовалась для подготовки и Windows-регрессии.
+
+Основная доставка — dist-macos/Signal2M-v0.3.1-macOS-Universal.zip, **5 767 813 байт**, SHA-256 d916a9fdbc52578769a74ad1e58ee8f5faa7c57dc767548344f4e6ed28e9aedf. Этот пакет содержит обе архитектуры и нативно проверен на arm64. Отдельная Universal-сборка того же commit прошла нативную проверку Intel. Developer ID и нотариализация отсутствуют; DAW/GUI и запуск на минимальных macOS 10.15 Intel / 11.0 Apple Silicon остаются ручными проверками.
+
+Отчёт внутри доставленного ZIP сохранён как исторический снимок исходников на момент сборки и может содержать прежние pending-статусы. Актуальный независимый отчёт — REVIEW_MACOS_REPORT.md в репозитории. Проверенный ZIP не перепаковывался ради обновления документации.
