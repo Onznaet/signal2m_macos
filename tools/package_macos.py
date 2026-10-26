@@ -116,22 +116,32 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return (numbers + (0, 0, 0))[:3]
 
 
+def macos_minimum_versions(otool_output: str) -> list[str]:
+    """Read OS minimum fields, excluding nested build-tool version fields."""
+    fields = {"LC_BUILD_VERSION": "minos", "LC_VERSION_MIN_MACOSX": "version"}
+    command = ""
+    versions = []
+    for line in otool_output.splitlines():
+        if re.match(r"\s*Load command\s+\d+\s*$", line):
+            command = ""
+        match = re.match(r"\s*cmd\s+(LC_\w+)\s*$", line)
+        if match:
+            command = match.group(1)
+        field = fields.get(command)
+        if field is not None:
+            match = re.match(rf"\s*{field}\s+([0-9.]+)\s*$", line)
+            if match:
+                versions.append(match.group(1))
+    return versions
+
+
 def verify_macho(executable: Path) -> dict:
     architectures = set(bootstrap.run(["/usr/bin/lipo", "-archs", str(executable)], capture=True).split())
     require(architectures == ARCHITECTURES, f"Expected arm64+x86_64 Mach-O; found {sorted(architectures)}")
     report = {}
     for architecture in sorted(ARCHITECTURES):
         commands = bootstrap.run(["/usr/bin/otool", "-arch", architecture, "-l", str(executable)], capture=True)
-        command = ""
-        versions = []
-        for line in commands.splitlines():
-            match = re.match(r"\s*cmd (LC_\w+)\s*$", line)
-            if match:
-                command = match.group(1)
-            if command in ("LC_BUILD_VERSION", "LC_VERSION_MIN_MACOSX"):
-                match = re.match(r"\s*(?:minos|version) ([0-9.]+)\s*$", line)
-                if match:
-                    versions.append(match.group(1))
+        versions = macos_minimum_versions(commands)
         require(len(versions) == 1 and version_tuple(versions[0]) == MINIMUM_VERSIONS[architecture],
                 f"Unexpected {architecture} minimum macOS version: {versions}")
         libraries = bootstrap.run(["/usr/bin/otool", "-arch", architecture, "-L", str(executable)], capture=True)
