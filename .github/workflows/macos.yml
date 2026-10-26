@@ -1,0 +1,85 @@
+name: macOS Universal (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mac_update_gid:
+        description: Dedicated macOS Google Sheet tab gid
+        required: true
+        default: '640439888'
+        type: string
+      upload_artifacts:
+        description: Explicitly upload the tested ZIP and logs to this workflow run
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  native-macos:
+    name: Universal build and native ${{ matrix.arch }} tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+      EXPECTED_ARCH: ${{ matrix.arch }}
+      MAC_UPDATE_GID: ${{ inputs.mac_update_gid }}
+    steps:
+      - name: Read source
+        # Official v7 tag resolved with git ls-remote on 2026-10-26.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify native runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          python3 -X utf8 -c 'import os, platform; assert platform.machine() == os.environ["EXPECTED_ARCH"]'
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+      - name: Build Universal, run the native slice, sign and verify ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-macos
+          bash tools/build_macos.sh --jobs 3 --mac-update-gid "$MAC_UPDATE_GID" 2>&1 | tee build-macos/github-actions-build.log
+      - name: Save tested delivery and native results when explicitly requested
+        if: ${{ success() && inputs.upload_artifacts }}
+        # Official v7 tag resolved with git ls-remote on 2026-10-26.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Signal2M-macOS-native-${{ matrix.arch }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          path: |
+            dist-macos/Signal2M-v0.3.1-macOS-Universal.zip
+            dist-macos/Signal2M-v0.3.1-macOS-Universal.zip.sha256
+            build-macos/native-test-results.json
+            build-macos/Testing/Temporary/LastTest.log
+      - name: Save diagnostics even when the build or tests fail
+        if: ${{ always() && inputs.upload_artifacts }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Signal2M-macOS-diagnostics-${{ matrix.arch }}
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 7
+          path: |
+            build-macos/github-actions-build.log
+            build-macos/native-test-results.json
+            build-macos/Testing/Temporary/LastTest.log
+            build-macos/Testing/Temporary/LastTestsFailed.log
+            build-macos/CMakeFiles/CMakeConfigureLog.yaml
