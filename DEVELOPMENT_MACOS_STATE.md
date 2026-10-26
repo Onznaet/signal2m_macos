@@ -1,34 +1,42 @@
 # LMZ Signal 2M — состояние Mac-порта
 
-27 октября 2026, Europe/Moscow. Пользователь изменил маршрут: требуется опубликовать проект в GitHub и действительно собрать Mac VST3 через GitHub Actions. Команда `bash tools/build_macos.sh` для Mac друга остаётся запасным вариантом. В Windows нет локального macOS SDK. Нативный Mac-бинарник пока не собран.
+27 октября 2026, Europe/Moscow. Нативная сборка macOS Universal 0.3.1 завершена через GitHub Actions. В run5 оба задания — Apple Silicon и Intel — завершились успешно: по **9/9 CTest**, проверка подписи, упаковка и загрузка извлечённого из ZIP VST3 независимым host.
 
-## Текущий доступ к GitHub
+- Репозиторий: [Onznaet/signal2m_macos](https://github.com/Onznaet/signal2m_macos).
+- Успешный прогон: [run5 — 40419330616](https://github.com/Onznaet/signal2m_macos/actions/runs/40419330616).
+- Исходный commit сборки: c3dc36f91ade3c6e5194ffceccd5a009faeab2ae.
+- Версия: 0.3.1; host name LMZ Signal 2M; bundle Signal2M.vst3; прежние IDs, параметры и state сохранены.
+- В обоих Universal-пакетах присутствуют arm64 и x86_64. Фактические минимумы load commands проверены: macOS 11.0 arm64 / 10.15 Intel.
 
-CLI `gh auth status` сообщает о недействующем сохранённом входе. Поиск интеграций нашёл GitHub, но `installed=false`; пользователю предложена установка. Секреты не извлекались и не запрашивались в чате. Загрузка исходников и запуск Actions авторизованы текущим запросом пользователя, пользователь явно выбрал публичный репозиторий `Onznaet/signal2m_macos`. Публичный стандартный Actions бесплатен; приватный использует лимит аккаунта, отсутствие расходов без проверки не гарантируется.
+## Основная доставка
 
-Workflow локально подготовлен для стандартных `macos-15-intel` и `macos-15`, включает сохранение диагностик даже после ошибки, артефакты включены по умолчанию и хранятся 7 дней. Публикация будет из отдельной папки с проверенным списком исходников, без `.tools`, build, личных пресетов и credentials. Пользователь создал публичный Onznaet/signal2m_macos с initial README. В открытой Chrome-вкладке выполнен вход; пользователь выбрал ручной выбор/перетаскивание подготовленных файлов. Сборка Actions ещё не запускалась. CLI OAuth прекращён, токен для браузерного маршрута не нужен.
+Готовый пакет: dist-macos/Signal2M-v0.3.1-macOS-Universal.zip, **5 767 813 байт**. Это Universal-сборка, нативно проверенная на arm64.
 
-## Зафиксировано
+```text
+d916a9fdbc52578769a74ad1e58ee8f5faa7c57dc767548344f4e6ed28e9aedf
+```
 
-- Исходная версия 0.3.1, host name `LMZ Signal 2M`, bundle `Signal2M.vst3`, все прежние коды, IDs и state сохраняются. Цель — Universal arm64+x86_64, macOS 10.15 Intel / 11 Apple Silicon.
-- Mac обновления: отдельный gid `640439888`, Windows gid `0`. A1/B1 и spreadsheet прежние. Только read-only запрос Mac CSV выполнен; получено HTTP200 и `0.3.1,https://vk.ru/lmzvuk`. Ячейки не менялись.
-- Добавлен нативный Foundation/NSURLSession transport, изолированный от Windows WinHTTP. Сохранены ограничения запроса, anonymous/TLS и фоновые вызовы. Политика завершения: bounded native cleanup, уникальный runtime delegate class на image, при патологическом незавершении один permanent image pin и circuit breaker. Нативную корректность этих путей нужно подтвердить стресс-тестом.
-- Общий updater suite перенесён на POSIX/Mac и запускает прямые HTTP probes вне main thread. Независимый Mac CFBundle/VST3 host, dylib fixture/lifecycle checker, тестовый plist для loopback и проверка fat Mach-O/ZIP подготовлены.
-- Mac bootstrap/build/package и ручной CI локально подготовлены; JUCE/CMake/Ninja закреплены. Для первого теста предусмотрена ad-hoc подпись, не Developer ID и не нотарификация. Никаких внешних uploads/workflow runs, установки в систему или запуска DAW не было.
-- Миграция прежних папок Windows-пресетов ранее отложена пользователем. Порт не переименовывает плагин повторно и не трогает пользовательские пресеты.
+Подпись — **ad-hoc**, Developer ID отсутствует, нотариализация Apple не выполнялась. Инструкция — MACOS_HANDOFF_RU.txt и docs/INSTALL_MACOS_RU.txt; в DAW устанавливается целая папка Signal2M.vst3.
 
-## Фактически выполнено здесь
+Intel job проверил тот же commit отдельной Universal-сборкой на x86_64. Её ZIP имеет другой хеш и не заменяет основную доставку:
 
-- Полная текущая Windows-сборка: PASS. Лог `build/mac/windows-regression-build.txt`.
-- CTest после платформенных изменений: **8/8 PASS**, 27.91 секунды. Включены реальные Windows VST3/параметры/state/MIDI/DSP/updater и независимый parser Mac-пакета. Лог `build/mac/windows-regression-ctest.txt`. Графика/DAW не запускались.
-- Проверки Mac tooling, manifest, UTF-8/LF, зависимостей, ZIP modes/symlink/hash, отрицательные fixtures и shell syntax: результаты `build-macos/tooling-windows-checks.json`.
-- Objective-C++ mock syntax checks выполнялись на Windows с декларационными stub headers и clang 23; результаты `build/mac/transport-mock-syntax-results.json`. Они не являются компиляцией с Apple SDK или выполнением Foundation.
-- Существующий Windows `dist` и установщик не перепаковывались в ходе Mac-порта.
+| Сборка run5 | Нативные тесты и archived host | Размер ZIP | SHA-256 ZIP |
+| --- | --- | --- | --- |
+| arm64, основная | 9/9 PASS; извлечённый VST3 PASS | 5 767 813 | d916a9fdbc52578769a74ad1e58ee8f5faa7c57dc767548344f4e6ed28e9aedf |
+| x86_64, отдельная | 9/9 PASS; извлечённый VST3 PASS | 5 767 812 | 5705d4f62db7cefb7088109a1b0ca99d39e911b2cb511540dcc5a6a18d62e3d0 |
 
-## Следующий шаг
+Каждый job запускал свой нативный срез собственной сборки. Эти два архива не объявляются побитово одинаковыми.
 
-Передать пользователю `dist-macos/Signal2M-v0.3.1-macOS-SOURCE.zip` после независимой проверки его состава. Это исходный комплект; в нём отсутствует готовый Mach-O/VST3.
+## Подтверждено
 
-Друг распаковывает комплект, проверяет prerequisites из `MACOS_HANDOFF_RU.txt` и запускает `bash tools/build_macos.sh`. После успеха нужны Mac ZIP, SHA-256, `build-macos/native-test-results.json` и LastTest.log. После ошибки нужен полный текст ошибки; не объявлять сборку успешной по наличию одного файла.
+Нативные проверки охватывают DSP, MIDI/NoteVoice, параметры и state, загрузку реального CFBundle/VST3, updater HTTP/TLS/privacy/cancellation и время жизни отдельного динамического модуля. Пакет прошёл проверки архитектур, plist/moduleinfo, минимальных ОС и системных зависимостей, ad-hoc подписи, ZIP CRC/SHA-256/прав/ссылок и native host после распаковки.
 
-Нативная сборка, фактическая подпись, загрузка и обработка Mac VST3, HTTP/TLS и dylib lifetime, обе реальные runtime-архитектуры, Gatekeeper/DAW и самые ранние целевые macOS остаются ожидающими. Одна машина подтверждает только свой нативный срез. Независимый итог — `REVIEW_MACOS_REPORT.md`; пользовательская визуальная приёмка — на Mac друга.
+Сохранённые результаты: build/github-publish/run5-arm64 и build/github-publish/run5-x86_64. Актуальный независимый итог — REVIEW_MACOS_REPORT.md в репозитории. Копия отчёта внутри уже доставленного ZIP остаётся историческим снимком исходников на момент сборки и может содержать прежний статус pending. ZIP после проверок не изменялся.
+
+Windows-регрессия ранее прошла **8/8 PASS**, 27.91 с: build/mac/windows-regression-ctest.txt. Windows dist и установщик в ходе Mac-доставки не перепаковывались. Mac читает отдельный update gid 640439888; Windows сохраняет gid=0. Таблица не редактировалась.
+
+## Остаётся ручная приёмка
+
+Нужны установка на Mac пользователя, проверка в DAW, внешний вид, открытие/закрытие редактора, автоматизация и реальные проекты. Запуск на минимальных macOS 10.15 Intel и 11.0 Apple Silicon отдельно не выполнялся; нативные CI jobs работали на macOS 15. Developer ID, нотариализация и проверка поведения Gatekeeper для публичной поставки остаются отдельными шагами.
+
+Для повторной локальной сборки остаётся bash tools/build_macos.sh; готовому VST3 Xcode, Python и инструменты сборки не нужны.
