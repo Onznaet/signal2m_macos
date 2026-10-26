@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 
-# Initialise Apple's toolchain before project() so every target, including JUCE
-# helpers, uses the same two slices. A separate build-macos directory keeps the
-# existing Windows build cache and delivery untouched.
+# Initialise Apple's product toolchain before project(). JUCE's native host
+# helper is configured separately below. A separate build-macos directory keeps
+# the existing Windows build cache and delivery untouched.
 if(CMAKE_HOST_APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS Universal architectures")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version (arm64 minimum is 11.0)")
@@ -38,6 +38,15 @@ set(JUCE_BUILD_EXTRAS OFF CACHE BOOL "" FORCE)
 set(JUCE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 if(MINGW)
     add_link_options(-static)
+endif()
+if(APPLE)
+    # JUCE 7 bootstraps juceaide in a separate host configure and does not
+    # forward the outer deployment target. Propagate it through both the
+    # inherited environment and JUCE 7's extra arguments; explicit -D also
+    # corrects a helper cache created by an earlier failed configure.
+    set(ENV{MACOSX_DEPLOYMENT_TARGET} "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    list(APPEND extra_compiler_flag_arguments
+        "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
 endif()
 add_subdirectory(dependencies/JUCE EXCLUDE_FROM_ALL)
 
