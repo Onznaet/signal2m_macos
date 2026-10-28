@@ -1,7 +1,11 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "UpdateChecker.h"
+#include "DonationLinks.h"
+#include "TempoSync.h"
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace
 {
@@ -30,7 +34,8 @@ juce::AudioParameterFloatAttributes percent()
 Signal2MAudioProcessor::Signal2MAudioProcessor()
     : juce::AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       parameters(*this, nullptr, "Signal2MState", createParameterLayout()),
-      updateChecker(std::make_unique<signal2m::UpdateChecker>(JucePlugin_VersionString))
+      updateChecker(std::make_unique<signal2m::UpdateChecker>(JucePlugin_VersionString)),
+      donationLinks(std::make_unique<signal2m::DonationLinks>())
 {
     raw.vco = parameters.getRawParameterValue("vco_freq");
     raw.depth = parameters.getRawParameterValue("lfo_mod");
@@ -43,6 +48,11 @@ Signal2MAudioProcessor::Signal2MAudioProcessor()
     raw.differentiated = parameters.getRawParameterValue("lfo_differentiated");
     raw.sync = parameters.getRawParameterValue("sync");
     raw.oscillation = parameters.getRawParameterValue("oscillation");
+    raw.lfoTempoSync = parameters.getRawParameterValue("lfo_tempo_sync");
+    raw.delayTempoSync = parameters.getRawParameterValue("delay_tempo_sync");
+    raw.fxPost = parameters.getRawParameterValue("fx_post");
+    raw.lfoDefinition = parameters.getParameter("lfo_freq");
+    raw.delayDefinition = parameters.getParameter("delay");
 }
 
 Signal2MAudioProcessor::~Signal2MAudioProcessor() = default;
@@ -50,6 +60,11 @@ Signal2MAudioProcessor::~Signal2MAudioProcessor() = default;
 signal2m::UpdateChecker& Signal2MAudioProcessor::getUpdateChecker() noexcept
 {
     return *updateChecker;
+}
+
+signal2m::DonationLinks& Signal2MAudioProcessor::getDonationLinks() noexcept
+{
+    return *donationLinks;
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout Signal2MAudioProcessor::createParameterLayout()
@@ -69,6 +84,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout Signal2MAudioProcessor::crea
     layout.add(std::make_unique<Bool>(ID{"lfo_differentiated", 1}, "LFO edge shape", false));
     layout.add(std::make_unique<Bool>(ID{"sync", 1}, "Sync", false));
     layout.add(std::make_unique<Bool>(ID{"oscillation", 1}, "Oscillation", false));
+    // Append new controls, retaining all original IDs, ranges, defaults and order.
+    layout.add(std::make_unique<Bool>(ID{"lfo_tempo_sync", 2}, "LFO tempo sync", false));
+    layout.add(std::make_unique<Bool>(ID{"delay_tempo_sync", 2}, "Delay tempo sync", true));
+    layout.add(std::make_unique<Bool>(ID{"fx_post", 2}, "Post FX", true));
     return layout;
 }
 
@@ -80,7 +99,34 @@ signal2m::Parameters Signal2MAudioProcessor::snapshot() const noexcept
     p.master = read(raw.master); p.mix = read(raw.mix); p.delayMs = read(raw.delay); p.repeats = read(raw.repeats);
     p.lfoRounded = read(raw.rounded) >= 0.5f; p.lfoDifferentiated = read(raw.differentiated) >= 0.5f;
     p.sync = read(raw.sync) >= 0.5f; p.oscillation = read(raw.oscillation) >= 0.5f;
+    p.lfoTempoSync = read(raw.lfoTempoSync) >= 0.5f;
+    p.delayTempoSync = read(raw.delayTempoSync) >= 0.5f;
+    p.fxPost = read(raw.fxPost) >= 0.5f;
+    const double bpm = getCurrentTempoBpm();
+    if (p.lfoTempoSync)
+        p.lfoHz = static_cast<float>(signal2m::tempo::lfoFrequency(raw.lfoDefinition->convertTo0to1(p.lfoHz), bpm));
+    if (p.delayTempoSync)
+        p.delayMs = static_cast<float>(signal2m::tempo::delayMilliseconds(raw.delayDefinition->convertTo0to1(p.delayMs), bpm));
     return p;
+}
+
+double Signal2MAudioProcessor::getTailLengthSeconds() const
+{
+    if (raw.fxPost->load(std::memory_order_relaxed) < 0.5f)
+        return signal2m::NoteVoice::tailSeconds;
+    if (raw.oscillation->load(std::memory_order_relaxed) >= 0.5f)
+        return std::numeric_limits<double>::infinity();
+    const auto settings = snapshot();
+    const double feedback = 0.96 * std::clamp(static_cast<double>(settings.repeats), 0.0, 1.0);
+    // Include the initial delayed pass and enough feedback traversals to fall
+    // below -120 dB, plus the slowest coupling/filter settling interval.
+    const double traversals = feedback > 0.0 ? 1.0 + std::ceil(std::log(1.0e-6) / std::log(feedback)) : 1.0;
+    const double seconds = settings.delayMs * 0.001 * traversals + 1.0;
+    // JUCE 7 converts finite tails through a signed sample count. Advertise an
+    // infinite tail if that representation would overflow at the active rate.
+    const double rate = std::max(8000.0, getSampleRate());
+    return std::isfinite(seconds) && seconds * rate < std::numeric_limits<int>::max() - 1.0
+        ? seconds : std::numeric_limits<double>::infinity();
 }
 
 void Signal2MAudioProcessor::prepareToPlay(double sampleRate, int maximumExpectedSamplesPerBlock)
@@ -141,19 +187,21 @@ void Signal2MAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
 {
     juce::ScopedNoDenormals noDenormals;
     juce::ignoreUnused(noDenormals);
-    voice.setParameters(snapshot());
-
     // A transport stop must not leave a held sequencer note running. Preview
     // notes received while the host is stopped still work: only the transition
     // from playing to stopped clears previous notes, before new events below.
     if (const auto* playHead = getPlayHead())
         if (const auto position = playHead->getPosition())
         {
+            if (const auto bpm = position->getBpm())
+                if (std::isfinite(*bpm) && *bpm > 0.0)
+                    currentTempoBpm.store(signal2m::tempo::sanitiseBpm(*bpm), std::memory_order_relaxed);
             const bool playing = position->getIsPlaying();
             if (transportWasPlaying && !playing)
                 voice.allSoundOff();
             transportWasPlaying = playing;
         }
+    voice.setParameters(snapshot());
 
     const int samples = buffer.getNumSamples();
     buffer.clear();
@@ -201,7 +249,19 @@ void Signal2MAudioProcessor::setStateInformation(const void* data, int size)
         {
             auto restored = juce::ValueTree::fromXml(*xml);
             if (restored.isValid())
+            {
+                // Loading a pre-0.4 preset into an already edited instance must
+                // restore legacy behaviour rather than retain new mode flags.
+                for (const auto* id : { "lfo_tempo_sync", "delay_tempo_sync", "fx_post" })
+                    if (!restored.getChildWithProperty("id", id).isValid())
+                    {
+                        juce::ValueTree missing("PARAM");
+                        missing.setProperty("id", id, nullptr);
+                        missing.setProperty("value", 0.0f, nullptr);
+                        restored.addChild(missing, -1, nullptr);
+                    }
                 parameters.replaceState(restored);
+            }
         }
 }
 

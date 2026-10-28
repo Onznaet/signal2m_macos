@@ -20,9 +20,9 @@ import subprocess
 import sys
 import zipfile
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 HOST_NAME = "LMZ Signal 2M"
-TOP = f"Signal2M-v{VERSION}-macOS-Universal"
+TOP = "Signal2M.vst3"
 CPUS = {0x01000007: ("x86_64", (10, 15, 0)), 0x0100000C: ("arm64", (11, 0, 0))}
 CLASSES = {
     "Audio Module Class": "abcdef019182faeb4c6d7a7a5367326d",
@@ -33,6 +33,16 @@ MAC_FEED = ("https://docs.google.com/spreadsheets/d/"
             "1ZyDHZskIvieqR_L6y4Ghu0gwvc6usByiNUF52y6AidM/"
             "export?format=csv&gid=640439888&range=A1%3AB1").encode("ascii")
 WIN_FEED = MAC_FEED.replace(b"gid=640439888", b"gid=0")
+DONATION_FEED = MAC_FEED.replace(b"gid=640439888&range=A1%3AB1", b"gid=1525027926&range=A1%3AA2")
+MANIFEST_PATH = "Contents/Resources/Build/MANIFEST.json"
+NATIVE_PATH = "Contents/Resources/Build/native-test-results.json"
+PROVENANCE_PATH = "Contents/Resources/Build/provenance.json"
+EXCLUSIONS = ["Contents/MacOS/Signal2M", "Contents/_CodeSignature/**", MANIFEST_PATH]
+EXPECTED_TESTS = {"Signal2MDspBehavior", "Signal2MMidiNoteVoice", "Signal2MIndependentDsp",
+                  "Signal2MParametersAndState", "Signal2MManualUpdateChecker", "Signal2MDonationLinks",
+                  "Signal2MRealMacVst3Module", "Signal2MMacUpdatePolicy", "Signal2MMacPackageParser",
+                  "Signal2MRealMacUpdateLifecycle"}
+
 
 
 def require(condition: bool, description: str) -> None:
@@ -178,12 +188,16 @@ def bundle_checks(bundle: Path, offline: bool) -> dict[str, bytes]:
                 "CFBundleExecutable": "Signal2M", "CFBundlePackageType": "BNDL",
                 "CFBundleShortVersionString": VERSION, "CFBundleVersion": VERSION}
     require(all(info.get(key) == value for key, value in expected.items()), "bundle metadata/identity/version mismatch")
-    passed("Info.plist identity, physical names and 0.3.1 versions")
+    passed("Info.plist identity, physical names and 0.4.0 versions")
     executable = bundle / "Contents/MacOS/Signal2M"
     require(executable.is_file() and not executable.is_symlink(), "native executable must be a regular bundle file")
     slices = universal_macho(executable.read_bytes())
     for item in slices:
-        require(MAC_FEED in item["bytes"] and WIN_FEED not in item["bytes"], "incorrect platform update feed in " + item["architecture"])
+        require(MAC_FEED in item["bytes"] and WIN_FEED not in item["bytes"] and DONATION_FEED in item["bytes"],
+                "incorrect Mac update/donation feed in " + item["architecture"])
+        for text in ("Доступна новая версия", "Используемая версия: ", "lfo_tempo_sync", "delay_tempo_sync", "fx_post"):
+            require(text.encode("utf-8") in item["bytes"], "missing current UI/parameter string: " + text)
+        require(b"BETA\0" not in item["bytes"], "macOS release contains the compiled BETA badge literal")
         print("SLICE " + json.dumps({k: v for k, v in item.items() if k != "bytes"}, ensure_ascii=False))
     passed("two genuine Mach-O slices, deployment targets, Apple runtime dependencies and Mac A1:B1 endpoint")
     metadata = sdk_json((bundle / "Contents/Resources/moduleinfo.json").read_text(encoding="utf-8"))
@@ -202,9 +216,16 @@ def bundle_checks(bundle: Path, offline: bool) -> dict[str, bytes]:
             relative = path.relative_to(bundle).as_posix()
             require(not relative.lower().endswith((".dll", ".exe", ".pdb", ".lib", ".obj")), "Windows/developer file in macOS bundle")
             regular[relative] = path.read_bytes()
+    bundle_links = {p.relative_to(bundle).as_posix(): os.readlink(p) for p in bundle.rglob("*") if p.is_symlink()}
+    bundle_modes = {p.relative_to(bundle).as_posix(): stat.S_IMODE(p.lstat().st_mode)
+                    for p in bundle.rglob("*") if p.is_file() or p.is_symlink()}
+    # Extracted offline files on Windows cannot preserve POSIX modes. The ZIP
+    # path validates the manifest against recorded ZIP modes instead.
+    if sys.platform == "darwin":
+        manifest_checks(regular, bundle_links, bundle_modes)
     if not offline:
         require(sys.platform == "darwin", "native codesign verification requires macOS; --offline is structural only")
-        result = subprocess.run(["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(bundle)],
+        result = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", "--all-architectures", "--verbose=2", str(bundle)],
                                 capture_output=True, encoding="utf-8", errors="strict", timeout=30)
         require(result.returncode == 0, "native codesign validation failed: " + result.stdout + result.stderr)
         passed("native codesign --verify --strict on the actual bundle")
@@ -217,51 +238,98 @@ def safe_relative(name: str) -> bool:
     return bool(parts) and name == PurePosixPath(name).as_posix() and not PurePosixPath(name).is_absolute() and not any(p in ("", ".", "..") for p in parts) and ":" not in name and "\\" not in name and "\0" not in name
 
 
-def zip_checks(path: Path, bundle_files: dict[str, bytes]) -> None:
-    checksum_path = path.with_suffix(path.suffix + ".sha256")
-    checksum = checksum_path.read_text(encoding="utf-8").split()[0]
+def inventory_excluded(name: str) -> bool:
+    return name in (EXCLUSIONS[0], MANIFEST_PATH) or name.startswith("Contents/_CodeSignature/")
+
+
+def manifest_checks(payload: dict[str, bytes], links: dict[str, str], modes: dict[str, int]) -> None:
+    for name in (MANIFEST_PATH, NATIVE_PATH, PROVENANCE_PATH,
+                 "Contents/Resources/Legal/THIRD_PARTY_NOTICES_MACOS.md"):
+        require(name in payload, "missing embedded resource: " + name)
+        require("\ufffd" not in payload[name].decode("utf-8", errors="strict"), "invalid delivery text: " + name)
+    require(any(name.startswith("Contents/Resources/Legal/licenses/") for name in payload), "missing embedded original licenses")
+    manifest = json.loads(payload[MANIFEST_PATH].decode("utf-8"))
+    require(manifest.get("schema_version") == 2 and manifest.get("release_channel") == "release"
+            and manifest.get("show_beta") is False
+            and manifest.get("version") == VERSION and manifest.get("product") == HOST_NAME
+            and manifest.get("format") == "VST3" and manifest.get("platform") == "macOS Universal"
+            and manifest.get("architectures") == ["arm64", "x86_64"]
+            and manifest.get("bundle_id") == "sound.lmz.signal2m", "manifest identity mismatch")
+    require(manifest.get("inventory_exclusions") == EXCLUSIONS, "manifest circular-signature inventory scope changed")
+    require(manifest.get("hash_scope") == "bundle-relative pre-sign resource inventory; final executable, signature and manifest are excluded to avoid circular hashes",
+            "manifest must describe its pre-sign resource scope")
+    policy = manifest.get("signing_policy", {})
+    require(policy.get("kind") in ("ad-hoc", "developer-id") and policy.get("notarization") == "not-performed"
+            and policy.get("verification_required_before_publish") is True, "invalid signing policy")
+    delivery = manifest.get("delivery_validation_policy", {})
+    require(delivery.get("native_architecture") in ("arm64", "x86_64")
+            and delivery.get("required") == ["full-zip-byte-mode-link-match", "extracted-codesign", "extracted-native-vst3-host", "independent-package-review"],
+            "missing post-archive verification requirements")
+    require(manifest.get("files") == {name: sha(data) for name, data in payload.items() if not inventory_excluded(name)},
+            "manifest does not account for every scoped resource byte")
+    require(manifest.get("symlinks", {}) == {name: target for name, target in links.items() if not inventory_excluded(name)},
+            "manifest symlink inventory mismatch")
+    require(manifest.get("modes") == {name: mode for name, mode in modes.items() if not inventory_excluded(name)},
+            "manifest permission inventory mismatch")
+    native = json.loads(payload[NATIVE_PATH].decode("utf-8"))
+    require(native.get("version") == VERSION and native.get("platform") == "macOS"
+            and native.get("release_channel") == "release" and native.get("show_beta") is False
+            and native.get("ctest") == "passed" and EXPECTED_TESTS.issubset(native.get("tests", []))
+            and native.get("native_test_architecture") in ("arm64", "x86_64")
+            and native.get("universal_binary_architectures") == ["arm64", "x86_64"]
+            and native.get("mac_update_gid") == "640439888" and native.get("donation_gid") == "1525027926",
+            "embedded report does not attest all ten native release tests and correct feeds")
+    require(delivery.get("native_architecture") == native.get("native_test_architecture"), "delivery/native architecture provenance mismatch")
+    source_hash = native.get("source_tested_executable_sha256", "")
+    require(re.fullmatch(r"[0-9a-f]{64}", source_hash) is not None, "invalid tested-source executable SHA-256")
+    require(manifest.get("native_checks") == native
+            and manifest.get("source_tested_executable_sha256") == source_hash, "manifest/native report provenance mismatch")
+    provenance = json.loads(payload[PROVENANCE_PATH].decode("utf-8"))
+    require(manifest.get("provenance") == provenance, "manifest/source provenance mismatch")
+    require(provenance.get("version") == VERSION and provenance.get("release_channel") == "release"
+            and provenance.get("show_beta") is False and isinstance(provenance.get("source_files"), dict)
+            and bool(provenance["source_files"]), "invalid embedded source provenance")
+    require(all(safe_relative(name) and re.fullmatch(r"[0-9a-f]{64}", digest)
+                for name, digest in provenance["source_files"].items()), "invalid source hash inventory")
+
+
+def zip_checks(path: Path, bundle_files: dict[str, bytes], bundle: Path, *, quiet: bool = False) -> None:
+    checksum = path.with_suffix(path.suffix + ".sha256").read_text(encoding="utf-8").split()[0]
     require(checksum == sha(path.read_bytes()), "archive SHA-256 sidecar mismatch")
     with zipfile.ZipFile(path) as archive:
         require(archive.testzip() is None, "archive CRC failure")
         names = archive.namelist()
-        require(len(names) == len(set(names)) and len(names) == len({n.casefold() for n in names}), "duplicate or case-colliding archive entries")
-        require(all(safe_relative(n.rstrip("/")) for n in names), "unsafe archive entry path")
-        payload = {}
-        links = {}
-        modes = {}
+        require(len(names) == len(set(names)) and len(names) == len({n.casefold() for n in names}), "duplicate/case-colliding archive entries")
+        require(all(safe_relative(name.rstrip("/")) and (name == TOP + "/" or name.startswith(TOP + "/")) for name in names),
+                "ZIP must contain only the whole root Signal2M.vst3 bundle")
+        payload, links, modes = {}, {}, {}
         for entry in archive.infolist():
             if entry.is_dir():
                 continue
-            if entry.filename.startswith("__MACOSX/"):
-                require(PurePosixPath(entry.filename).name.startswith("._"), "unexpected AppleDouble sidecar")
-                continue
-            require(entry.filename.startswith(TOP + "/"), "archive has an unexpected top-level directory")
             name = entry.filename[len(TOP) + 1:]
             mode = entry.external_attr >> 16
             modes[name] = stat.S_IMODE(mode)
             if stat.S_ISLNK(mode):
                 target = archive.read(entry).decode("utf-8", errors="strict")
                 resolved = os.path.normpath(str(PurePosixPath(name).parent / target)).replace("\\", "/")
-                require(not target.startswith("/") and ":" not in target and not resolved.startswith("../") and resolved != "..", "escaping archive symlink")
+                require(not target.startswith("/") and ":" not in target and "\\" not in target
+                        and "\0" not in target and not resolved.startswith("../") and resolved != "..", "escaping archive symlink")
                 links[name] = target
             else:
-                require(stat.S_ISREG(mode), "archive payload has a non-regular special file")
+                require(stat.S_ISREG(mode), "archive contains a non-regular special file")
                 payload[name] = archive.read(entry)
-        for name in ("MANIFEST.json", "INSTALL_MACOS_RU.txt", "THIRD_PARTY_NOTICES_MACOS.md"):
-            require(name in payload, "missing delivery file: " + name)
-            require("\ufffd" not in payload[name].decode("utf-8", errors="strict"), "replacement character in delivery text")
-        manifest = json.loads(payload["MANIFEST.json"].decode("utf-8"))
-        require(manifest.get("version") == VERSION and manifest.get("product") == HOST_NAME and manifest.get("format") == "VST3", "manifest identity mismatch")
-        normal = {name: sha(data) for name, data in payload.items() if name != "MANIFEST.json"}
-        require(manifest.get("files") == normal and manifest.get("symlinks", {}) == links, "manifest does not account for exact payload bytes/links")
-        expected_modes = {name: mode for name, mode in modes.items() if name != "MANIFEST.json"}
-        require(manifest.get("modes") == expected_modes, "manifest permissions mismatch")
-        archived = {name[len("Signal2M.vst3/"):]: data for name, data in payload.items() if name.startswith("Signal2M.vst3/")}
-        require(archived == bundle_files, "archive bundle differs from the actual checked/signature-verified bundle")
-        require(modes.get("Signal2M.vst3/Contents/MacOS/Signal2M", 0) & 0o111, "archive lost executable permissions")
-        require(not any(n.startswith(("Source/", "Tests/", "build/", ".tools/", "dependencies/")) or n.lower().endswith((".exe", ".dll", ".pdb")) for n in payload), "developer or Windows files leaked into delivery")
-        passed("ZIP CRC, SHA-256, paths, executable modes, manifest, and complete checked bundle bytes")
-        print("ARCHIVE_SHA256 " + sha(path.read_bytes()))
+        manifest_checks(payload, links, modes)
+        require(payload == bundle_files, "full archived bundle differs from the actual checked bundle")
+        actual_links = {p.relative_to(bundle).as_posix(): os.readlink(p) for p in bundle.rglob("*") if p.is_symlink()}
+        require(links == actual_links, "archive symlinks differ from the actual checked bundle")
+        if sys.platform == "darwin":
+            actual_modes = {p.relative_to(bundle).as_posix(): stat.S_IMODE(p.lstat().st_mode)
+                            for p in bundle.rglob("*") if p.is_file() or p.is_symlink()}
+            require(modes == actual_modes, "archive modes differ from native checked bundle")
+        require(modes.get("Contents/MacOS/Signal2M", 0) & 0o111, "archive lost executable permissions")
+        if not quiet:
+            passed("bundle-only ZIP, CRC/SHA, full bundle bytes, links/modes and scoped embedded manifest")
+            print("ARCHIVE_SHA256 " + sha(path.read_bytes()))
 
 
 def self_test() -> None:
@@ -322,7 +390,76 @@ def self_test() -> None:
         raise ValueError("self-test accepted " + name)
     require(sdk_json('{"URL":"https://example.test/,]", "A":[1,],}') == {"URL": "https://example.test/,]", "A": [1]}, "trailing-comma parser damaged string")
     require(not any(safe_relative(name) for name in ("../escape", "/absolute", "C:/x", "x\\y")), "unsafe path accepted")
-    print(f"RESULT reviewer_macho_parser_self_test=PASS negative_cases={len(bad_cases)} native_mac_build=NOT_RUN")
+    # Generated archive fixtures exercise delivery shape and the deliberate
+    # signature/executable exclusions. These are NOT macOS build artifacts.
+    import tempfile
+    native = {"platform": "macOS", "version": VERSION, "release_channel": "release", "show_beta": False,
+              "native_test_architecture": "arm64", "universal_binary_architectures": ["arm64", "x86_64"],
+              "ctest": "passed", "tests": sorted(EXPECTED_TESTS), "mac_update_gid": "640439888",
+              "donation_gid": "1525027926", "source_tested_executable_sha256": "0" * 64}
+    payload = {"Contents/MacOS/Signal2M": b"synthetic archive fixture, not Mach-O",
+               "Contents/_CodeSignature/CodeResources": b"synthetic seal fixture",
+               "Contents/Resources/Legal/THIRD_PARTY_NOTICES_MACOS.md": b"synthetic notices",
+               "Contents/Resources/Legal/licenses/example.txt": b"synthetic license",
+               NATIVE_PATH: json.dumps(native).encode("utf-8"),
+               PROVENANCE_PATH: json.dumps({"version": VERSION, "release_channel": "release", "show_beta": False,
+                                            "source_files": {"Source/example.cpp": "1" * 64}}).encode("utf-8")}
+    modes = {name: 0o755 if name == "Contents/MacOS/Signal2M" else 0o644 for name in payload}
+    manifest = {"version": VERSION, "product": HOST_NAME, "format": "VST3", "platform": "macOS Universal",
+                "architectures": ["arm64", "x86_64"], "bundle_id": "sound.lmz.signal2m",
+                "inventory_exclusions": EXCLUSIONS, "native_checks": native,
+                "source_tested_executable_sha256": "0" * 64, "symlinks": {},
+                "files": {name: sha(data) for name, data in payload.items() if not inventory_excluded(name)},
+                "modes": {name: mode for name, mode in modes.items() if not inventory_excluded(name)}}
+    manifest.update(schema_version=2, release_channel="release", show_beta=False,
+                    provenance=json.loads(payload[PROVENANCE_PATH].decode("utf-8")),
+                    hash_scope="bundle-relative pre-sign resource inventory; final executable, signature and manifest are excluded to avoid circular hashes",
+                    signing_policy={"kind": "ad-hoc", "notarization": "not-performed", "verification_required_before_publish": True},
+                    delivery_validation_policy={"native_architecture": "arm64", "required": ["full-zip-byte-mode-link-match", "extracted-codesign", "extracted-native-vst3-host", "independent-package-review"]})
+    payload[MANIFEST_PATH] = json.dumps(manifest).encode("utf-8")
+    modes[MANIFEST_PATH] = 0o644
+    with tempfile.TemporaryDirectory(prefix="signal2m-reviewer-zip-") as temporary:
+        bundle = Path(temporary) / TOP
+        for name, data in payload.items():
+            file = bundle / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(data)
+            file.chmod(modes[name])
+        archive_path = Path(temporary) / "fixture.zip"
+        def archive_case(changed=None, *, extra=None, parent="", executable_mode=0o755):
+            entries = dict(payload)
+            if changed:
+                entries.update(changed)
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name, data in entries.items():
+                    entry = zipfile.ZipInfo(parent + TOP + "/" + name)
+                    entry.create_system = 3
+                    mode = executable_mode if name == "Contents/MacOS/Signal2M" else modes[name]
+                    entry.external_attr = (stat.S_IFREG | mode) << 16
+                    archive.writestr(entry, data)
+                if extra:
+                    entry = zipfile.ZipInfo(extra)
+                    entry.create_system = 3
+                    entry.external_attr = (stat.S_IFREG | 0o644) << 16
+                    archive.writestr(entry, b"outside-bundle")
+            archive_path.with_suffix(".zip.sha256").write_text(sha(archive_path.read_bytes()) + "\n", encoding="utf-8")
+        archive_case()
+        zip_checks(archive_path, payload, bundle, quiet=True)
+        negative_archives = [
+            {"parent": "old-delivery-folder/"}, {"extra": "README.txt"},
+            {"extra": "__MACOSX/._Signal2M.vst3"}, {"executable_mode": 0o644},
+            {"changed": {"Contents/MacOS/Signal2M": b"tampered excluded executable"}},
+            {"changed": {"Contents/_CodeSignature/CodeResources": b"tampered excluded seal"}},
+            {"changed": {"Contents/Resources/Legal/licenses/example.txt": b"tampered inventoried resource"}},
+        ]
+        for kwargs in negative_archives:
+            archive_case(**kwargs)
+            try:
+                zip_checks(archive_path, payload, bundle, quiet=True)
+            except ValueError:
+                continue
+            raise ValueError("self-test accepted invalid bundle-only archive: " + str(kwargs))
+    print(f"RESULT reviewer_macho_parser_self_test=PASS negative_cases={len(bad_cases)} archive_negative_cases={len(negative_archives)} native_mac_build=NOT_RUN")
 
 
 def main() -> int:
@@ -342,7 +479,7 @@ def main() -> int:
     require(args.bundle is not None, "--bundle is required for a real artifact")
     files = bundle_checks(args.bundle.resolve(), args.offline)
     if args.zip:
-        zip_checks(args.zip.resolve(), files)
+        zip_checks(args.zip.resolve(), files, args.bundle.resolve())
     print("RESULT structural_checks=PASS native_signature=" + ("PENDING" if args.offline else "PASS") + " native_vst3_loading=SEPARATE_CHECK_REQUIRED")
     return 0
 

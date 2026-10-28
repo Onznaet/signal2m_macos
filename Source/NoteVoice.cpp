@@ -32,8 +32,21 @@ void NoteVoice::applyParameters() noexcept
 
 void NoteVoice::setParameters(const Parameters& parameters) noexcept
 {
+    const bool wasPost = parameters_.fxPost;
     parameters_ = parameters;
     applyParameters();
+    if (wasPost != parameters_.fxPost)
+    {
+        if (!parameters_.fxPost && !active_ && fxRunning_)
+            modeTailFadeRemaining_ = releaseSamples_;
+        else if (parameters_.fxPost && modeTailFadeRemaining_ > 0)
+            stopSound(); // A completed note must not be re-excited by mode changes.
+        else if (parameters_.fxPost && active_)
+        {
+            fxRunning_ = true;
+            fxChannel_ = selectedChannel_;
+        }
+    }
 }
 
 void NoteVoice::stopSound() noexcept
@@ -42,6 +55,8 @@ void NoteVoice::stopSound() noexcept
     selectedChannel_ = 0;
     selectedNote_ = -1;
     attackRemaining_ = releaseRemaining_ = 0;
+    modeTailFadeRemaining_ = fxChannel_ = 0;
+    fxRunning_ = false;
     transitionStart_ = lastOutput_ = 0.0;
     applyParameters();
     engine_.reset();
@@ -58,7 +73,13 @@ void NoteVoice::trigger(int channel, int note, bool bridgePreviousSample) noexce
     selectedChannel_ = channel;
     selectedNote_ = note;
     applyParameters();
-    engine_.reset();
+    if (parameters_.fxPost && fxRunning_)
+        engine_.resetGenerator();
+    else
+        engine_.reset();
+    fxRunning_ = parameters_.fxPost;
+    fxChannel_ = channel;
+    modeTailFadeRemaining_ = 0;
     transitionStart_ = bridgePreviousSample ? lastOutput_ : 0.0;
     lastOutput_ = transitionStart_;
     attackRemaining_ = attackSamples_;
@@ -98,6 +119,16 @@ void NoteVoice::beginRelease() noexcept
         releaseRemaining_ = releaseSamples_;
         releasing_ = true;
     }
+}
+
+void NoteVoice::finishPostRelease() noexcept
+{
+    active_ = releasing_ = false;
+    selectedChannel_ = 0;
+    selectedNote_ = -1;
+    attackRemaining_ = releaseRemaining_ = 0;
+    transitionStart_ = 0.0;
+    // Keep FX history, filter/feedback state and fxChannel_ for a later panic.
 }
 
 void NoteVoice::noteOff(int channel, int note) noexcept
@@ -170,7 +201,8 @@ void NoteVoice::allSoundOff(int channel) noexcept
     if (channel < 0 || channel > 16)
         return;
     removeHeldChannel(channel);
-    if (active_ && (channel == 0 || selectedChannel_ == channel))
+    if (channel == 0 || (active_ && selectedChannel_ == channel)
+        || (!active_ && fxRunning_ && fxChannel_ == channel))
     {
         stopSound();
         if (heldCount_ > 0)
@@ -185,10 +217,55 @@ void NoteVoice::process(float* left, float* right, int numSamples) noexcept
 {
     if (numSamples <= 0)
         return;
-    if (!active_)
+    if (!parameters_.fxPost && !active_ && modeTailFadeRemaining_ > 0)
+    {
+        const int count = std::min(numSamples, modeTailFadeRemaining_);
+        for (int i = 0; i < count; ++i)
+        {
+            const float wet = engine_.processGatedSample(0.0);
+            --modeTailFadeRemaining_;
+            lastOutput_ = wet * static_cast<double>(modeTailFadeRemaining_)
+                          / static_cast<double>(releaseSamples_);
+            left[i] = right[i] = static_cast<float>(lastOutput_);
+        }
+        if (modeTailFadeRemaining_ == 0)
+            stopSound();
+        std::fill_n(left + count, numSamples - count, 0.0f);
+        std::fill_n(right + count, numSamples - count, 0.0f);
+        return;
+    }
+    if (!active_ && !(parameters_.fxPost && fxRunning_))
     {
         std::fill_n(left, numSamples, 0.0f);
         std::fill_n(right, numSamples, 0.0f);
+        return;
+    }
+
+    if (parameters_.fxPost)
+    {
+        for (int i = 0; i < numSamples; ++i)
+        {
+            double gain = active_ ? 1.0 : 0.0;
+            double retriggerGain = 0.0;
+            if (active_ && attackRemaining_ > 0)
+            {
+                gain = static_cast<double>(attackSamples_ - attackRemaining_)
+                       / static_cast<double>(attackSamples_);
+                retriggerGain = 1.0 - gain;
+                --attackRemaining_;
+            }
+            if (releasing_)
+            {
+                --releaseRemaining_;
+                const double release = static_cast<double>(releaseRemaining_) / static_cast<double>(releaseSamples_);
+                gain *= release;
+                retriggerGain *= release;
+            }
+            lastOutput_ = engine_.processGatedSample(gain, retriggerGain);
+            left[i] = right[i] = static_cast<float>(lastOutput_);
+            if (releasing_ && releaseRemaining_ == 0)
+                finishPostRelease();
+        }
         return;
     }
 

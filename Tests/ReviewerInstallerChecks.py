@@ -106,7 +106,7 @@ def main() -> int:
           "external installer SHA-256 matches actual EXE")
     resources = version_strings(INSTALLER)
     check(resources.get("ProductName") == HOST_NAME and resources.get("ProductVersion") == VERSION
-          and resources.get("FileVersion") == VERSION, "shipping installer is branded LMZ Signal 2M with version 0.3.1")
+          and resources.get("FileVersion") == VERSION, "shipping installer is branded LMZ Signal 2M with version 0.4.0")
     check(HOST_NAME in resources.get("FileDescription", ""), "installer description identifies the product")
     manifest = ET.fromstring(execution_manifest(INSTALLER).decode("utf-8-sig"))
     levels = [element.attrib.get("level") for element in manifest.iter() if element.tag.endswith("requestedExecutionLevel")]
@@ -154,7 +154,8 @@ def main() -> int:
             elif name.startswith("licenses/"):
                 expected[prefix + name] = archive.read(name)
         runtime = {"$PLUGINSDIR/modern-wizard.bmp", "$PLUGINSDIR/nsDialogs.dll", "$PLUGINSDIR/System.dll"}
-        check(set(entries) == set(expected) | runtime, "installer has exactly 37 product files and three NSIS runtime resources")
+        check(set(entries) == set(expected) | runtime,
+              f"installer has exactly {len(expected)} reviewed product files and three NSIS runtime resources")
         for name, original in expected.items():
             extracted = member(name)
             check(extracted == original, "byte-exact installer payload: " + name)

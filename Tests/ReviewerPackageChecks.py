@@ -10,15 +10,16 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-# Filled only after the current startup-check/name-change module passes the CLI host.
-VERIFIED_BINARY_SHA256 = "adb0a3823ff7aa0b1bc8bc24f5a3c5c05c758963b4eae1a9c3f86e5638a84b08"
-VERSION = "0.3.1"
+# Pinned after the 28 October UI/donation revision passed the independent CLI host.
+VERIFIED_BINARY_SHA256 = "de8ca3e887fd9e79066fff43e88feee60ac3d6914743cd8b17d74301da62604c"
+VERSION = "0.4.0"
 HOST_NAME = "LMZ Signal 2M"
-ZIP = ROOT / "dist/Signal2M-v0.3.1-Windows-x64.zip"
+ZIP = ROOT / "dist" / f"Signal2M-v{VERSION}-Windows-x64.zip"
 EXTRACTED = ROOT / "dist/Signal2M-v0.1-Windows-x64"
 BUNDLE = ROOT / "build/Signal2M_artefacts/Release/VST3/Signal2M.vst3"
 BINARY_NAME = "Signal2M.vst3/Contents/x86_64-win/Signal2M.vst3"
 UPDATE_SOURCE = "https://docs.google.com/spreadsheets/d/1ZyDHZskIvieqR_L6y4Ghu0gwvc6usByiNUF52y6AidM/export?format=csv&gid=0&range=A1%3AB1"
+DONATION_SOURCE = "https://docs.google.com/spreadsheets/d/1ZyDHZskIvieqR_L6y4Ghu0gwvc6usByiNUF52y6AidM/export?format=csv&gid=1525027926&range=A1%3AA2"
 
 
 def check(condition: bool, description: str) -> None:
@@ -35,8 +36,8 @@ def main() -> int:
     for output in (sys.stdout, sys.stderr):
         if hasattr(output, "reconfigure"):
             output.reconfigure(encoding="utf-8", errors="strict")
-    check(len(VERIFIED_BINARY_SHA256) == 64, "independent 0.3.1 binary hash is recorded before package approval")
-    check(ZIP.is_file(), "0.3.1 delivery ZIP exists")
+    check(len(VERIFIED_BINARY_SHA256) == 64, "independent 0.4.0 binary hash is recorded before package approval")
+    check(ZIP.is_file(), "0.4.0 delivery ZIP exists")
     checksum = ZIP.with_suffix(".zip.sha256").read_text(encoding="utf-8").split()[0]
     check(checksum == sha(ZIP.read_bytes()), "external ZIP SHA-256 matches the actual archive")
     with zipfile.ZipFile(ZIP) as archive:
@@ -54,14 +55,19 @@ def main() -> int:
               "module is Windows PE x86_64")
         check(sha(binary) == VERIFIED_BINARY_SHA256, "archive contains the exact independently loaded/tested module")
         check(HOST_NAME.encode("utf-8") in binary, "new host-visible product name is compiled in the checked module")
+        for parameter in ("lfo_tempo_sync", "delay_tempo_sync", "fx_post"):
+            check(parameter.encode("utf-8") in binary, "new persistent parameter ID is embedded: " + parameter)
         check(b"https://t.me/lenmodzvuk" in binary,
               "the supplied Telegram destination is embedded in the tested module")
         check(UPDATE_SOURCE.encode("utf-8") in binary,
               "the fixed public A1:B1 CSV source is embedded in the tested module")
+        check(DONATION_SOURCE.encode("utf-8") in binary,
+              "the separate Don A1:A2 CSV source is embedded in the tested module")
         check(b"https://vk.ru/lmzvuk" not in binary,
               "the currently observed B1 update page is dynamic, not a compiled fallback")
         for label in ("Проверить обновления", "Проверяем…", "Обновлений нет", "Доступна версия ",
-                      "Перейти к обновлениям", "Не удалось проверить обновления. Попробуйте позже", "Новая версия"):
+                      "Перейти к обновлениям", "Не удалось проверить обновления. Попробуйте позже",
+                      "Доступна новая версия", "Используемая версия: "):
             check(label.encode("utf-8") in binary, "update UI label is present: " + label)
         if int(VERSION.split(".")[0]) == 0:
             check(b"BETA" in binary, "BETA artwork is included for this major-zero build")
@@ -70,7 +76,7 @@ def main() -> int:
         # fields without treating its JSON5-style output as strict JSON.
         metadata_versions = re.findall(r'"Version"\s*:\s*"([^"]+)"', metadata)
         check(bool(metadata_versions) and set(metadata_versions) == {VERSION},
-              "moduleinfo and every factory class advertise version 0.3.1")
+              "moduleinfo and every factory class advertise version 0.4.0")
         class_names = re.findall(r'"Category"\s*:\s*"(?:Audio Module Class|Component Controller Class)"\s*,\s*"Name"\s*:\s*"([^"]+)"', metadata)
         check(len(class_names) == 2 and set(class_names) == {HOST_NAME},
               "moduleinfo audio/controller names are LMZ Signal 2M while the bundle filename is preserved")
@@ -113,10 +119,18 @@ def main() -> int:
         notes = archive.read("VERSION_NOTES_RU.txt").decode("utf-8")
         check("C:\\Program Files\\Common Files\\VST3" in install and "целиком" in install,
               "installation describes copying the complete bundle to the standard VST3 directory")
-        check("Без нот выход молчит" in install and "MIDI note 60" in install and "5 мс" in install, "MIDI silence, neutral key and finite note duration are explained")
+        check("MIDI note 60" in install and "5 мс" in install and "Post" in install and "хвост" in install.lower(),
+              "neutral key, short source release and retained Post FX tail are explained")
+        check("BPM" in install and "1/512T" in install and "LFO" in install and "Delay" in install,
+              "tempo controls and their triplet endpoint are documented")
+        check("0.4.0" in notes and "пресет" in notes.lower() and "выключ" in notes.lower(),
+              "0.4.0 notes explain legacy-preset mode compatibility")
         check("сердцевины" in install.lower() and "лампа" in install.lower() and "0,5" in notes, "rotating caps and the authorised LFO LEDs are disclosed")
-        check("0.3" in notes and "SVG" in notes and "t.me/lenmodzvuk" in notes and "донат" in notes.lower(),
-              "0.3 artwork, support popup and donation placeholders are documented")
+        check("SVG" in notes and "t.me/lenmodzvuk" in notes and "донат" in notes.lower(),
+              "retained artwork, support popup and donation feature are documented")
+        check("1525027926" in install and "A1" in install and "A2" in install
+              and "скры" in install.lower(),
+              "the donation feed, independent vertical cells and hidden unavailable rows are documented")
         check("https://t.me/lenmodzvuk" in install + notes and "Esc" in install + notes,
               "the user-provided Telegram destination and popup dismissal are explained")
         check("Проверить обновления" in install and "Проверяем…" in install
@@ -124,15 +138,17 @@ def main() -> int:
               "installation explains explicit checking and the dynamic B1 browser link")
         check("8 секунд" in install and "64 KiB" in notes,
               "bounded background network limits are disclosed")
-        check("Новая версия" in install + notes and "перв" in (install + notes).lower()
-              and "редактор" in (install + notes).lower(), "first-editor startup checking and the logo badge are disclosed")
+        check("Доступна новая версия" in install and "перв" in (install + notes).lower()
+              and "редактор" in (install + notes).lower(), "first-editor startup checking and the current conditional logo badge are disclosed")
+        check("Используемая версия: " + VERSION in install,
+              "the separate installed-build version row is explained in the current installation guide")
         check(VERSION in install and HOST_NAME in install and "BETA" in install and "1.0.0" in install,
-              "installed version is 0.3.1 with the new display name and conditional BETA")
+              "installed version is 0.4.0 with the preserved display name and conditional BETA")
         check("фиксац" in notes and "не подтвержден" in notes, "provisional latching and unverified hardware equivalence are disclosed")
         manifest = json.loads(archive.read("MANIFEST.json").decode("utf-8"))
         check(manifest.get("product") == HOST_NAME and manifest.get("version") == VERSION
               and manifest.get("platform") == "Windows x64" and manifest.get("format") == "VST3",
-              "manifest product LMZ Signal 2M, version 0.3.1, platform and format")
+              "manifest product LMZ Signal 2M, version 0.4.0, platform and format")
         check(manifest.get("manual_daw_and_visual_checks") == "pending user", "manual DAW/visual acceptance is honestly pending")
         files = manifest["files"]
         check(set(files) == {name for name in names if name != "MANIFEST.json" and not name.endswith("/")},
@@ -160,9 +176,9 @@ def main() -> int:
             check(sha((ROOT / relative).read_bytes()) in notice_hashes, "original notice included unchanged: " + relative)
         check(EXTRACTED.is_dir(), "established legacy-named copy-from directory exists")
         check(all((EXTRACTED / name).is_file() and (EXTRACTED / name).read_bytes() == archive.read(name)
-                  for name in names if not name.endswith("/")), "every v0.3.1 ZIP file matches the updated existing copy-from directory")
+                  for name in names if not name.endswith("/")), "every v0.4.0 ZIP file matches the updated existing copy-from directory")
         extracted_manifest = json.loads((EXTRACTED / "MANIFEST.json").read_text(encoding="utf-8"))
-        check(extracted_manifest.get("version") == VERSION, "legacy directory name contains v0.3.1 payload metadata")
+        check(extracted_manifest.get("version") == VERSION, "legacy directory name contains v0.4.0 payload metadata")
         print("RESULT delivery_checks=PASS entries=" + str(len(names)) + " bytes=" + str(ZIP.stat().st_size))
         print("ARCHIVE_SHA256 " + sha(ZIP.read_bytes()))
         print("BINARY_SHA256 " + sha(binary))

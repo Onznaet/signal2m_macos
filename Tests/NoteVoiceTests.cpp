@@ -103,12 +103,14 @@ bool silence(const std::vector<float>& audio, std::size_t begin = 0)
                        [](float sample) { return sample == 0.0f; });
 }
 
-double rms(const std::vector<float>& audio, std::size_t begin = 0)
+double rms(const std::vector<float>& audio, std::size_t begin = 0,
+           std::size_t end = std::numeric_limits<std::size_t>::max())
 {
+    end = std::min(end, audio.size());
     double energy = 0.0;
-    for (std::size_t i = begin; i < audio.size(); ++i)
+    for (std::size_t i = begin; i < end; ++i)
         energy += static_cast<double>(audio[i]) * audio[i];
-    return std::sqrt(energy / static_cast<double>(audio.size() - begin));
+    return std::sqrt(energy / static_cast<double>(end - begin));
 }
 
 double difference(const std::vector<float>& a, const std::vector<float>& b, std::size_t begin = 0)
@@ -416,6 +418,12 @@ void testRealtimeStorageAndEventCapacity()
         voice.noteOn(channel, note);
         p.delayMs = (i & 1) != 0 ? 35.0f : 650.0f;
         p.vcoHz = (i & 2) != 0 ? 10.0f : 8000.0f;
+        p.fxPost = (i & 4) != 0;
+        p.lfoTempoSync = p.delayTempoSync = (i & 8) != 0;
+        if (p.lfoTempoSync)
+            p.lfoHz = (i & 16) != 0 ? 1.0f / 192.0f : 3196.8f;
+        if (p.delayTempoSync)
+            p.delayMs = (i & 32) != 0 ? 0.3128128f : 24000.0f;
         voice.setParameters(p);
         voice.process(left.data(), right.data(), static_cast<int>(left.size()));
         voice.noteOff(channel, note);
@@ -447,6 +455,207 @@ void testRealtimeStorageAndEventCapacity()
     voice.noteOn(1, 128);
     require(!voice.isActive(), "Invalid MIDI channels and keys must be ignored");
 }
+
+void testPostShortNoteEchoAndLegacyCut()
+{
+    for (double rate : { 44100.0, 48000.0 })
+    {
+        for (bool post : { false, true })
+        {
+            for (bool cc123 : { false, true })
+            {
+                NoteVoice voice;
+                auto p = dryParameters();
+                p.fxPost = post;
+                p.mix = 1.0f;
+                p.delayMs = 137.0f;
+                p.repeats = 0.0f;
+                voice.setParameters(p);
+                voice.prepare(rate, 17);
+                voice.noteOn(3, 60);
+                const int note = static_cast<int>(rate * 0.020);
+                renderOn(voice, note, { 1, 17, 1024 });
+                if (cc123)
+                    voice.allNotesOff(3);
+                else
+                    voice.noteOff(3, 60);
+                const int release = static_cast<int>(std::floor(rate * NoteVoice::tailSeconds));
+                const auto fade = renderOn(voice, release, { 1, 19, 512 });
+                require(!voice.isActive(), "Both placements must complete the note's dry release within 5 ms");
+                require(fade.back() == 0.0f, "A short note with a pending echo must reach exact dry silence");
+                const auto tail = renderOn(voice, static_cast<int>(rate * 0.35), { 1, 127, 2048 });
+                if (post)
+                {
+                    const int echo = static_cast<int>(rate * 0.137) - note - release;
+                    require(rms(tail, 0, static_cast<std::size_t>(echo - 2)) == 0.0,
+                            "Post may not leak a continuing generator between release and the pending echo");
+                    require(rms(tail, static_cast<std::size_t>(echo), static_cast<std::size_t>(echo + note)) > 0.04,
+                            "Post Note Off and CC123 must retain an echo that arrives after the entire note has ended");
+                    require(rms(tail, static_cast<std::size_t>(rate * 0.25)) < 1.0e-6,
+                            "With Repeats zero a Post short note must become silent after its single echo");
+                }
+                else
+                {
+                    require(silence(tail), "Pre must retain legacy whole-FX Note Off and CC123 muting");
+                }
+            }
+        }
+    }
+}
+
+void testPostRetriggerHistoryAndContinuity()
+{
+    for (double rate : { 44100.0, 48000.0 })
+    {
+        for (bool post : { false, true })
+        {
+            auto p = dryParameters();
+            p.fxPost = post;
+            p.mix = 1.0f;
+            p.delayMs = 180.0f;
+            p.repeats = 0.0f;
+            NoteVoice dirty, fresh;
+            for (auto* voice : { &dirty, &fresh })
+            {
+                voice->setParameters(p);
+                voice->prepare(rate, 17);
+            }
+            dirty.noteOn(1, 60);
+            renderOn(dirty, static_cast<int>(rate * 0.03));
+            dirty.noteOff(1, 60);
+            renderOn(dirty, static_cast<int>(rate * 0.02));
+            dirty.noteOn(2, 84);
+            fresh.noteOn(2, 84);
+            require(dirty.getLfoPhase() == 0.0f, "A Post retrigger still restarts the generator LFO");
+            const int samples = static_cast<int>(rate * 0.17);
+            const auto continued = renderOn(dirty, samples, { 1, 127, 2048 });
+            const auto clean = renderOn(fresh, samples, { 512, 17 });
+            const double error = difference(continued, clean, static_cast<std::size_t>(rate * 0.01));
+            if (post)
+                require(error > 0.03, "Post must retain the previous note's pending echo across a new Note On");
+            else
+                require(error == 0.0, "Pre must clear the previous note's echo on every Note On");
+        }
+
+        NoteVoice voice;
+        auto p = dryParameters();
+        p.fxPost = true;
+        voice.setParameters(p);
+        voice.prepare(rate, 64);
+        voice.noteOn(1, 60);
+        const auto old = renderOn(voice, 7913);
+        voice.noteOn(2, 79);
+        const auto retriggered = renderOn(voice, 3000);
+        require(retriggered.front() == old.back(), "Post retrigger must bridge the preceding dry excitation without a discontinuity");
+        const auto clean = renderNote(p, 79, rate, 3000);
+        require(difference(retriggered, clean, static_cast<std::size_t>(std::ceil(rate * 0.003))) == 0.0,
+                "After its short bridge the Post source must match a fresh oscillator and dry filter state");
+    }
+}
+
+void testPostOscillationAndPanicAfterRelease()
+{
+    for (double rate : { 44100.0, 48000.0 })
+    {
+        auto p = dryParameters();
+        p.fxPost = p.oscillation = true;
+        p.mix = 1.0f;
+        p.delayMs = 90.0f;
+        p.repeats = 0.0f;
+        NoteVoice voice;
+        voice.setParameters(p);
+        voice.prepare(rate, 17);
+        require(silence(renderOn(voice, static_cast<int>(rate))),
+                "Post Oscillation must never create autonomous sound before any note excites it");
+        voice.noteOn(5, 60);
+        renderOn(voice, static_cast<int>(rate * 0.10));
+        voice.allNotesOff();
+        const auto tail = renderOn(voice, static_cast<int>(rate * 10.0), { 1, 17, 127, 2048 });
+        require(!voice.isActive(), "Post Oscillation tail must outlive note activity");
+        const double sustained = rms(tail, static_cast<std::size_t>(rate * 9.0));
+        require(sustained > 0.01, "A short note must seed a continuing Post Oscillation loop after Note Off");
+        voice.allSoundOff(4);
+        require(rms(renderOn(voice, static_cast<int>(rate * 0.2))) > 0.01,
+                "A foreign-channel panic must preserve the current tail owner");
+        voice.allSoundOff(5);
+        require(silence(renderOn(voice, static_cast<int>(rate))),
+                "The tail owner's CC120 must mute and clear FX even while the note is inactive");
+        voice.noteOn(5, 60);
+        renderOn(voice, static_cast<int>(rate * 0.10));
+        voice.noteOff(5, 60);
+        renderOn(voice, static_cast<int>(rate * 0.2));
+        voice.allSoundOff();
+        require(silence(renderOn(voice, static_cast<int>(rate))),
+                "Global panic must clear all Post filter, Oscillation and delay state after release");
+        voice.noteOn(1, 60);
+        const auto afterPanic = renderOn(voice, static_cast<int>(rate * 0.3));
+        require(difference(afterPanic, renderNote(p, 60, rate, static_cast<int>(rate * 0.3))) == 0.0,
+                "A note following panic must reproduce a fresh Post FX state");
+        voice.noteOff(1, 60);
+        renderOn(voice, static_cast<int>(rate * 0.2));
+        p.oscillation = false;
+        voice.setParameters(p);
+        const auto decayed = renderOn(voice, static_cast<int>(rate * 2.0));
+        require(rms(decayed, static_cast<std::size_t>(rate)) < 1.0e-6,
+                "Turning Oscillation off must return a Post tail to Repeats-controlled decay");
+        voice.reset();
+        p.oscillation = true;
+        voice.setParameters(p);
+        require(silence(renderOn(voice, static_cast<int>(rate))),
+                "Reset of an inactive Post tail must prevent later Oscillation from resurrecting it");
+    }
+}
+
+void testPostModeAutomationAndBlocks()
+{
+    for (double rate : { 44100.0, 48000.0 })
+    {
+        auto p = dryParameters();
+        p.fxPost = p.oscillation = true;
+        p.mix = 1.0f;
+        p.delayMs = 35.0f;
+        const auto sequence = [&](const std::vector<int>& blocks)
+        {
+            NoteVoice voice;
+            voice.setParameters(p);
+            voice.prepare(rate, 64);
+            std::vector<float> output;
+            const auto append = [&](int count)
+            {
+                const auto audio = renderOn(voice, count, blocks);
+                output.insert(output.end(), audio.begin(), audio.end());
+            };
+            voice.noteOn(1, 60);
+            append(5079);
+            voice.noteOff(1, 60);
+            append(3313);
+            voice.noteOn(2, 79);
+            append(1031);
+            voice.allNotesOff();
+            append(7519);
+            auto pre = p;
+            pre.fxPost = false;
+            voice.setParameters(pre);
+            append(static_cast<int>(rate * 0.020));
+            require(silence(renderOn(voice, 1000, blocks)), "Post to Pre without a held note must clear its tail within 5 ms");
+            voice.setParameters(p);
+            require(silence(renderOn(voice, 2000, blocks)), "Returning to Post may not revive cleared history");
+            voice.process(nullptr, nullptr, 0);
+            return output;
+        };
+        require(difference(sequence({ 256 }), sequence({ 1, 17, 127, 2048 })) == 0.0,
+                "Post attacks, releases, FX preservation and mode changes must be block invariant");
+
+        NoteVoice idle;
+        idle.prepare(rate, 17);
+        for (int i = 0; i < 40; ++i)
+        {
+            p.fxPost = (i & 1) != 0;
+            idle.setParameters(p);
+            require(silence(renderOn(idle, 137)), "FX placement automation may not excite a never-played voice");
+        }
+    }
+}
 } // namespace
 
 int main()
@@ -462,7 +671,11 @@ int main()
         { "channel/global All Notes Off and All Sound Off", testAllNotesAndSoundOff },
         { "actual selected LFO waveform telemetry", testWaveformTelemetry },
         { "sample rates, blocks, reset, reprepare and empty input", testBlocksResetAndEmptyInput },
-        { "realtime storage, extreme events and full held-note capacity", testRealtimeStorageAndEventCapacity }
+        { "realtime storage, extreme events and full held-note capacity", testRealtimeStorageAndEventCapacity },
+        { "Post short-note echoes and legacy Pre cutoff", testPostShortNoteEchoAndLegacyCut },
+        { "Post history-preserving retrigger and dry continuity", testPostRetriggerHistoryAndContinuity },
+        { "Post Oscillation, owner/global panic and inactive reset", testPostOscillationAndPanicAfterRelease },
+        { "Post mode automation, idle safety and block invariance", testPostModeAutomationAndBlocks }
     };
     int failed = 0;
     for (const auto& test : tests)

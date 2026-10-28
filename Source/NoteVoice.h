@@ -25,6 +25,7 @@ public:
     void process(float* left, float* right, int numSamples) noexcept;
     float getLfoPhase() const noexcept;
     float getLfoValue() const noexcept;
+    // Note/short release activity. In Post, an FX tail can outlive this flag.
     bool isActive() const noexcept { return active_; }
 
 private:
@@ -39,6 +40,7 @@ private:
     void applyParameters() noexcept;
     void trigger(int channel, int note, bool bridgePreviousSample) noexcept;
     void beginRelease() noexcept;
+    void finishPostRelease() noexcept;
     void stopSound() noexcept;
     void removeHeldChannel(int channel) noexcept;
 
@@ -52,10 +54,13 @@ private:
     int releaseSamples_ = 1;
     int attackRemaining_ = 0;
     int releaseRemaining_ = 0;
+    int modeTailFadeRemaining_ = 0;
+    int fxChannel_ = 0;
     double transitionStart_ = 0.0;
     double lastOutput_ = 0.0;
     bool prepared_ = false;
     bool active_ = false;
     bool releasing_ = false;
+    bool fxRunning_ = false;
 };
 } // namespace signal2m

@@ -18,6 +18,9 @@ struct Parameters
     bool lfoDifferentiated = false;
     bool sync = false;
     bool oscillation = false;
+    bool lfoTempoSync = false;
+    bool delayTempoSync = false;
+    bool fxPost = false;
     // Internal note offset, not a DAW parameter. Applied before LFO and limits.
     float noteSemitones = 0.0f;
 };
@@ -30,8 +33,15 @@ class SynthEngine
 public:
     void prepare(double sampleRate, int maximumBlockSize);
     void reset() noexcept;
+    // Retrigger only the source. Delay samples, wet filters and feedback survive.
+    // Its previous excitation is retained for a short generator crossfade.
+    void resetGenerator() noexcept;
     void setParameters(const Parameters&) noexcept;
     void process(float* left, float* right, int numSamples) noexcept;
+    // Gate the AC-coupled generator before both dry output and delay input.
+    // retriggerGain blends the frozen excitation from resetGenerator(); zero
+    // excitation and retrigger gains keep processing only the existing FX tail.
+    float processGatedSample(double excitationGain, double retriggerGain = 0.0) noexcept;
     float getLfoPhase() const noexcept { return static_cast<float>(lfoPhase_); }
     float getLfoValue() const noexcept { return static_cast<float>(lastLfoValue_); }
 
@@ -74,6 +84,8 @@ private:
     double delayLowpass2_ = 0.0;
     double feedbackDcInput_ = 0.0;
     double feedbackDcOutput_ = 0.0;
+    double lastExcitation_ = 0.0;
+    double retriggerExcitation_ = 0.0;
     std::vector<float> delayBuffer_;
     std::size_t delayWritePosition_ = 0;
     std::size_t delayValidSamples_ = 0;

@@ -14,11 +14,11 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED = (
-    "CMakeLists.txt", "PROMPT_MACOS_ORCHESTRATOR.md", "REVIEW_MACOS_REPORT.md",
+    "CMakeLists.txt", "REVIEW_MACOS_REPORT.md",
     "THIRD_PARTY_NOTICES_MACOS.md", "MACOS_HANDOFF_RU.txt", "DEVELOPMENT_MACOS_STATE.md",
     "TECHNICAL_DECISIONS.md", "DSP_DECISIONS.md", "SPEC_SIGNAL_2M_V1.md",
     "tools/bootstrap_mac.py", "tools/build_macos.py", "tools/build_macos.sh",
-    "tools/package_macos.py", "tools/package_macos_source.py",
+    "tools/package_macos.py", "tools/package_macos_source.py", "tools/macos_release.py",
     "tools/juce7-clang23.patch", "tools/macos-loopback-test-Info.plist",
     "docs/BUILD_MACOS_RU.md", "docs/INSTALL_MACOS_RU.txt",
     ".github/workflows/macos.yml",

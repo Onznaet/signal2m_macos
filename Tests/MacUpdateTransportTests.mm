@@ -1,6 +1,7 @@
 // Native, headless macOS-only privacy/lifetime probes. No editor or DAW is run.
 // The HTTP and silent-TLS fixtures listen only on 127.0.0.1 with ephemeral ports.
 #include "UpdateChecker.h"
+#include "DonationLinks.h"
 #import <Foundation/Foundation.h>
 
 #include <arpa/inet.h>
@@ -124,6 +125,8 @@ public:
     }
 
     std::atomic<unsigned> accepted { 0 }, clientHelloBytes { 0 }, authRequests { 0 }, cookieTargets { 0 }, privateHeaders { 0 };
+    std::atomic<unsigned> concurrentUpdates { 0 }, concurrentDonations { 0 }, nonGetRequests { 0 };
+    std::atomic<bool> releaseConcurrentUpdate { false }, releaseConcurrentDonation { false };
 
 private:
     void reply(int socket, const std::string& body, const std::string& headers = {}, int code = 200)
@@ -155,7 +158,22 @@ private:
             || lower.find("\r\nproxy-authorization:") != std::string::npos) ++privateHeaders;
         const auto first = request.find(' '), last = request.find(' ', first + 1);
         if (first == std::string::npos || last == std::string::npos) return;
+        if (request.rfind("GET ", 0) != 0) ++nonGetRequests;
         const auto path = request.substr(first + 1, last - first - 1);
+        if (path == "/concurrent-update" || path == "/concurrent-donations")
+        {
+            const bool donation = path == "/concurrent-donations";
+            if (donation) ++concurrentDonations;
+            else ++concurrentUpdates;
+            auto& released = donation ? releaseConcurrentDonation : releaseConcurrentUpdate;
+            while (!released.load(std::memory_order_acquire) && !stopped.load()) std::this_thread::sleep_for(2ms);
+            if (stopped.load()) return;
+            if (donation)
+                reply(socket, "\xef\xbb\xbf\"" + url(u8"/помощь?item=a,b").toStdString()
+                                + "\"\r\n\"" + url("/donate-second").toStdString() + "\"\r\n");
+            else reply(socket, "9.9.9," + url("/update-from-B1").toStdString() + "\r\n");
+            return;
+        }
         const std::string body = "0.4,https://example.test/from-B1\r\n";
         if (path == "/cookie") reply(socket, "", "Location: /cookie-target\r\nSet-Cookie: lmz_fixture=private; Path=/\r\n", 302);
         else if (path == "/cookie-target") { ++cookieTargets; reply(socket, body); }
@@ -232,6 +250,81 @@ void privacyAndRepeatedQuiescence()
     require(fixture.accepted == 15, "Exactly one GET per explicit fetch and redirect must be made");
     std::this_thread::sleep_for(20ms);
     requireQuiescent();
+}
+
+void concurrentUpdaterAndDonations()
+{
+    enum class Completion { both, cancelDonation, cancelUpdate };
+    for (const auto mode : { Completion::both, Completion::cancelDonation, Completion::cancelUpdate })
+    {
+        Fixture fixture;
+        detail::CheckerOptions updateOptions;
+        updateOptions.endpoint = fixture.url("/concurrent-update");
+        updateOptions.timeout = 5s;
+        detail::CheckerOptions donationOptions;
+        donationOptions.endpoint = fixture.url("/concurrent-donations");
+        donationOptions.timeout = 5s;
+        auto updater = std::make_unique<signal2m::UpdateChecker>("0.0.0", updateOptions);
+        auto donations = std::make_unique<signal2m::DonationLinks>(donationOptions);
+        require(updater->checkForUpdates() && donations->refresh(), "Updater and donation loaders must start independent native workers");
+        // Both request handlers hold response headers until explicitly released.
+        // This proves actual overlap, rather than two sequential fast fetches.
+        waitUntil([&] { return fixture.concurrentUpdates == 1 && fixture.concurrentDonations == 1; });
+        require(updater->result().state == signal2m::UpdateState::checking
+                && donations->result().state == signal2m::DonationState::loading,
+                "Both native requests must remain active at the fixture barrier");
+        require(detail::macUpdateActiveContexts() == 2 && detail::macUpdateDelegateClasses() == 2,
+                "Overlapping requests must own two separate callback contexts and delegate classes");
+
+        if (mode == Completion::cancelDonation)
+        {
+            const auto start = Clock::now();
+            donations.reset(); // Destruction cancels and joins only this worker.
+            require(Clock::now() - start < 650ms, "Concurrent donation destruction must retain bounded native cancellation");
+            require(updater->result().state == signal2m::UpdateState::checking,
+                    "Cancelling donations must not cancel or complete the updater request");
+        }
+        else if (mode == Completion::cancelUpdate)
+        {
+            const auto start = Clock::now();
+            updater.reset();
+            require(Clock::now() - start < 650ms, "Concurrent updater destruction must retain bounded native cancellation");
+            require(donations->result().state == signal2m::DonationState::loading,
+                    "Cancelling updates must not cancel or complete the donation request");
+        }
+        if (mode != Completion::both)
+            require(detail::macUpdateActiveContexts() == 1 && detail::macUpdateDelegateClasses() == 1,
+                    "Cancelling one request must release only its own native context and delegate class");
+
+        if (updater != nullptr) fixture.releaseConcurrentUpdate.store(true, std::memory_order_release);
+        if (donations != nullptr) fixture.releaseConcurrentDonation.store(true, std::memory_order_release);
+        if (updater != nullptr)
+        {
+            waitUntil([&] { return updater->result().state != signal2m::UpdateState::checking; });
+            const auto result = updater->result();
+            require(result.state == signal2m::UpdateState::available && result.latestVersion == "9.9.9"
+                    && result.pageUrl == fixture.url("/update-from-B1"),
+                    "Overlapping native fetches must publish the updater's own version and B1 URL");
+        }
+        if (donations != nullptr)
+        {
+            waitUntil([&] { return donations->result().state != signal2m::DonationState::loading; });
+            const auto result = donations->result();
+            require(result.state == signal2m::DonationState::ready
+                    && result.urls[0] == fixture.url(u8"/помощь?item=a,b")
+                    && result.urls[1] == fixture.url("/donate-second"),
+                    "Overlapping native fetches must preserve donation A1/A2 UTF-8 CSV independently of the update body");
+        }
+        updater.reset();
+        donations.reset();
+        // The diagnostic counters are per image, so quiescence is meaningful
+        // only after BOTH owners have cancelled/completed and joined.
+        requireQuiescent();
+        require(fixture.accepted == 2 && fixture.privateHeaders == 0 && fixture.nonGetRequests == 0,
+                "Concurrent feeds must make exactly two anonymous GETs without following either result URL");
+        std::this_thread::sleep_for(20ms);
+        requireQuiescent();
+    }
 }
 
 void cancelAndDestroy(bool tls)
@@ -321,6 +414,7 @@ int main(int argc, char** argv)
         };
         run("invalid URLs, pre-cancel and zero native contexts", invalidAndPreCancelled);
         run("anonymous cookies/auth and repeated quiescence", privacyAndRepeatedQuiescence);
+        run("concurrent native update/donation results, independent cancellation and joined quiescence", concurrentUpdaterAndDonations);
         run("HTTP cancellation/destruction quiescence", [] { cancelAndDestroy(false); });
         run("TLS handshake cancellation/destruction quiescence", [] { cancelAndDestroy(true); });
         run("silent TLS absolute deadline", [&] { Fixture peer(true); tlsDeadline(peer.url("/")); require(peer.clientHelloBytes > 0, "TLS fixture must observe an actual ClientHello"); });

@@ -514,6 +514,133 @@ void testUnpreparedAndEmptyBlocks()
     require(std::all_of(left.begin(), left.end(), [](float sample) { return sample == 0.0f; }),
             "Empty blocks must leave output storage untouched");
 }
+
+void testTempoLfoRangeAndPhaseContinuity()
+{
+    for (double rate : { 44100.0, 48000.0 })
+    {
+        SynthEngine engine;
+        engine.prepare(rate, 17);
+        auto p = dryParameters();
+        p.lfoTempoSync = true;
+        p.lfoHz = 1.0f / 192.0f; // 8/1 at 10 BPM.
+        engine.setParameters(p);
+        engine.reset();
+        renderOn(engine, static_cast<int>(rate * 2.0), { 1, 127, 1024 });
+        require(std::abs(engine.getLfoPhase() - 1.0 / 96.0) < 1.0e-6,
+                "Tempo LFO must accept a slower cycle than the free 0.1 Hz limit");
+        const double before = engine.getLfoPhase();
+        p.lfoHz = 3196.8f; // 1/512T at 999 BPM.
+        engine.setParameters(p);
+        engine.processGatedSample(1.0);
+        const double expected = std::fmod(before + static_cast<double>(p.lfoHz) / rate, 1.0);
+        require(std::abs(engine.getLfoPhase() - expected) < 1.0e-6,
+                "Tempo changes must immediately use the new rate without resetting LFO phase");
+        const int count = static_cast<int>(rate * 0.137);
+        renderOn(engine, count);
+        require(std::abs(engine.getLfoPhase() - std::fmod(expected + count * static_cast<double>(p.lfoHz) / rate, 1.0)) < 1.0e-5,
+                "Tempo LFO must reach the full 3196.8 Hz range without the legacy 250 Hz clamp");
+
+        p.lfoTempoSync = false;
+        engine.setParameters(p);
+        engine.reset();
+        renderOn(engine, static_cast<int>(rate * 0.101));
+        const double freeExpected = std::fmod(static_cast<int>(rate * 0.101) * 250.0 / rate, 1.0);
+        require(std::abs(engine.getLfoPhase() - freeExpected) < 1.0e-5,
+                "The free LFO range must retain its legacy 250 Hz maximum");
+    }
+
+    auto p = dryParameters();
+    p.lfoHz = 7.25f;
+    p.lfoDepth = 0.7f;
+    p.sync = true;
+    const auto free = render(p, 48000.0, 1.0);
+    p.fxPost = true;
+    require(difference(free, render(p, 48000.0, 1.0)) == 0.0,
+            "FX placement must not change the direct continuously running engine");
+    p.lfoTempoSync = p.delayTempoSync = p.fxPost = true;
+    require(difference(free, render(p, 48000.0, 1.0)) < 1.0e-4,
+            "Tempo flags at identical in-range values must preserve source behavior within free-rate rounding");
+}
+
+void testTempoDelayRangeAndLongHistory()
+{
+    for (double rate : { 44100.0, 48000.0 })
+    {
+        for (float milliseconds : { 0.3128128f, 1.0f, 17.0f, 800.0f })
+        {
+            auto p = dryParameters();
+            p.delayTempoSync = true;
+            p.delayMs = milliseconds;
+            p.repeats = 0.0f;
+            const double seconds = milliseconds * 0.001 + 0.15;
+            const auto dry = render(p, rate, seconds);
+            p.mix = 1.0f;
+            const auto wet = render(p, rate, seconds, { 1, 17, 2048 });
+            const double onset = firstDifference(dry, wet) * 1000.0 / rate;
+            require(std::abs(onset - milliseconds) < 0.3,
+                    "Synced delay must retain sub-35 ms and over-650 ms times with finite filtering");
+        }
+
+        SynthEngine engine;
+        engine.prepare(rate, 64);
+        auto p = dryParameters();
+        p.delayTempoSync = true;
+        p.delayMs = 24000.0f;
+        p.mix = 1.0f;
+        p.repeats = 0.0f;
+        engine.setParameters(p);
+        engine.reset();
+        const int noteSamples = static_cast<int>(rate * 0.04);
+        const int echoSample = static_cast<int>(rate * 24.0);
+        int firstWet = -1;
+        double echoEnergy = 0.0;
+        for (int i = 0; i < echoSample + noteSamples + 100; ++i)
+        {
+            const float sample = engine.processGatedSample(i < noteSamples ? 1.0 : 0.0);
+            require(std::isfinite(sample), "The 24-second delay filter must stay finite");
+            if (i >= noteSamples && std::abs(sample) > 1.0e-6f && firstWet < 0)
+                firstWet = i;
+            if (i >= echoSample)
+                echoEnergy += static_cast<double>(sample) * sample;
+        }
+        require(firstWet >= echoSample && firstWet < echoSample + 10,
+                "The longest tempo delay must reproduce a short seed after 24 seconds, with no early stale history");
+        require(echoEnergy > 0.1, "The 24-second echo must remain audible");
+        engine.reset();
+        for (int i = 0; i < echoSample + 100; ++i)
+            require(engine.processGatedSample(0.0) == 0.0f,
+                    "O(1) full reset must invalidate every old tap even after the long ring wraps");
+    }
+}
+
+void testGeneratorResetKeepsFxAndFullResetClearsIt()
+{
+    auto p = dryParameters();
+    p.mix = 1.0f;
+    p.delayMs = 137.0f;
+    p.repeats = 0.0f;
+    SynthEngine preserved, cleared;
+    for (auto* engine : { &preserved, &cleared })
+    {
+        engine->prepare(48000.0, 64);
+        engine->setParameters(p);
+        engine->reset();
+        renderOn(*engine, 4000);
+    }
+    preserved.resetGenerator();
+    cleared.reset();
+    require(preserved.getLfoPhase() == 0.0f, "Generator-only reset must restart LFO phase");
+    double keptEnergy = 0.0;
+    for (int i = 0; i < 10000; ++i)
+    {
+        const double kept = preserved.processGatedSample(0.0);
+        keptEnergy += kept * kept;
+        require(cleared.processGatedSample(0.0) == 0.0f,
+                "A full reset must silence FX without requiring a buffer-sized clear");
+    }
+    require(keptEnergy > 1.0, "Generator-only reset must preserve a pending echo independently of new excitation");
+}
 } // namespace
 
 int main()
@@ -530,7 +657,10 @@ int main()
         { "sample rates, block sizes, instances and reset", testSampleRatesBlocksInstancesAndReset },
         { "fractional delay interpolation at ring boundaries", testDelayWrapBoundaries },
         { "automation, realtime allocations and long feedback stability", testAutomationRobustnessAndRealtimeStorage },
-        { "unprepared engine and empty blocks", testUnpreparedAndEmptyBlocks }
+        { "unprepared engine and empty blocks", testUnpreparedAndEmptyBlocks },
+        { "tempo LFO range, immediate rate and continuous phase", testTempoLfoRangeAndPhaseContinuity },
+        { "tempo delay range, 24-second echo and O(1) reset", testTempoDelayRangeAndLongHistory },
+        { "generator reset preserves FX; full reset clears it", testGeneratorResetKeepsFxAndFullResetClearsIt }
     };
     int failed = 0;
     for (const auto& test : tests)

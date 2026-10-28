@@ -58,3 +58,71 @@ Checker принадлежит Processor, но processBlock, prepare/reset и st
 Windows transport использует async WinHTTP с одним steady_clock deadline 8 секунд на DNS/connect/headers/body и пределом 64 KiB. Перенаправлений не более 3, HTTPS downgrade, cookies и authentication отключены. Native callbacks владеют контекстом до полного session unload event, поэтому после завершения checker не остаётся выполняемого callback-кода в выгружаемой DLL. Отмена будит ожидания; handles закрываются worker-ом вне callback mutex. Условия ожидания, отмена и teardown проверяются контролируемым localhost server/DLL harness. WinHTTP — системная Windows библиотека, дополнительных runtime DLL в пакет не добавляется.
 
 CSV валидируется как UTF-8 с поддержкой BOM/quotes/CRLF и ровно двух полей первой записи. Числовые части версий сравниваются лексикографически с нулевым дополнением: 0.1=0.1.0, 0.10>0.9. Неподдерживаемые/переполненные числа, неверный CSV/URL/HTTP/content-type/таймаут приводят к единому failed. При новой проверке старая ссылка удаляется. Строка результата рисуется простым текстом без markup. Проверка не скачивает и не устанавливает дистрибутив.
+
+
+## Windows 0.4.0: музыкальное время и Post FX
+
+Сохраняются исходные 11 параметров, их порядок, диапазоны и VST3 IDs. В конец
+добавлены три bool: lfo_tempo_sync, delay_tempo_sync, fx_post. Заводские значения
+нового экземпляра: false, true, true. Внутренние Parameters движка сохраняют
+legacy-default false; Processor передаёт актуальные значения APVTS.
+Отсутствующие поля при чтении старого state явно получают false, включая загрузку
+в уже отредактированный экземпляр. Версия берётся из CMake 0.4.0, BETA сохранена.
+
+TempoSync.h задаёт длительности в четвертных долях. LFO: 26 положений 8/1..1/512T;
+Delay: 20 положений 1/1..1/512T. Внутри каждой пары straight/triplet, следующее
+значение короче предыдущего. Исходные нормированные положения ручек сохраняются;
+режим T меняет интерпретацию, не перезаписывая свободный параметр. LFO = BPM /
+(60 * beats), delay_ms = 60000 * beats / BPM. Playhead читается только в processBlock;
+нет BPM — последнее корректное, изначально120, положительные значения ограничены10..999.
+Это tempo-rate sync с нотным retrigger, без phase lock к PPQ проекта.
+
+При Post нотная огибающая находится перед сухой/параллельной FX-ветвью. Перезапуск
+генератора отделён от полного reset: новая нота перезапускает VCO/LFO, сохраняя
+delay/feedback. Note Off гасит источник за5ms, хвост продолжает обрабатываться.
+Полный reset/transport-stop/All Sound Off очищают FX даже без активной ноты.
+Для Post+Oscillation хост получает infinite tail; обычная обратная связь получает
+консервативный конечный budget с защитой от переполнения sample count в JUCE7.
+Максимальный sync delay24s при10BPM; память выделяется в prepare, не в аудиопотоке.
+Свободные пределы остаются прежними, положение фильтра для длинных sync delay
+ограничивается физическим диапазоном исходной модели.
+
+Параметры и sound engine не зависят от таймера UI. T/T/P используют APVTS attachments,
+включая host automation и восстановление. Аппаратный Sync остаётся LFO/VCO hard sync.
+Готовые Mac0.3.1 артефакты не перепаковываются; текущая поставка только Windows.
+
+## Дополнение Windows 0.4.0 BETA от 28 октября 2026
+
+Внешняя геометрия: canvas1248×908, металлическая панель1200×860 с inset24.
+Процедурная тёмная деревянная рамка16px, фаски/стыки/фактура кешируются вместе
+с artwork. Все controls и LEDs используют тот же content origin. Resize limits:
+874×636..1872×1362, default1123×817. Подняты headers и рамки, title cx142;
+T/T/P24px, LFO-Ty331, Delay-T/Mix-Py598, rounding по краям исключает пересечения.
+Русский ModeButton::getTooltip использует actual toggle state; штатные650ms.
+Уведомление под логотипом только при available: «Доступна новая версия».
+Постоянная строка «Используемая версия: X» только в карточке, X от build version.
+
+Донатные ссылки вынесены в Don!A1/A2, gid1525027926 того же spreadsheet.
+CMake задаёт endpoint source-local для DonationLinks.cpp. Processor владеет
+DonationLinks; constructor/result не запускают I/O. Единственный UI refresh
+в showSupportOverlay, каждое открытие; loading/busy не блокирует интерфейс.
+Cached result читается только в UI. Новые параметры/state поля не добавлены,
+аудиофункции и DSP не менялись. Используется прежний bounded fetchHttp с
+RequestControl: до8s, до64KiB, TLS и cancellation прежние. Worker отменяется
+и join выполняется при уничтожении Processor-owned loader.
+
+Вертикальный CSV сохраняет позиции A1/A2. Empty/unsafe URL скрывает только
+соответствующий ряд; оба пустые/error/loading скрывают оба и заголовок донатов.
+Любой новый refresh очищает старые URL. Клики используют проверенный http(s)
+и destination generation: смена ссылки между mouse-down/up отменяет переход.
+Return/accessibility triggerClick используют немедленный snapshot. Открытие
+обычного браузера происходит только по явной активации, платежей в плагине нет.
+
+Рендер QA выполнен временным offscreen helper из настоящего SharedCode без
+native editor peer/window и без DAW. Для снимков разных network states временный
+helper подменяет только HTTP fetch; это не изменение или проверка реальной
+таблицы. Прошли targeted5/5 CTest, новый DonationLinks8groups, host4582/0,
+independent updater263/0. DSP/sanitizer результаты27Oct относятся к неизменённым
+исходникам, повтор не выполнялся. Live WinHTTP в restricted context вернул12185;
+тот же probe в обычном Windows context: HTTP200, parse_ok, обе ссылки присутствуют.
+TLS/transport при этом не менялись. Фактические подробности — REVIEW_REPORT.md.
