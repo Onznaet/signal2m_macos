@@ -50,11 +50,17 @@ jobs:
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-path
       - name: Build Universal, run the native slice, sign and verify ZIP
+        id: build
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p build-macos
           bash tools/build_macos.sh --jobs 3 --mac-update-gid "$MAC_UPDATE_GID" 2>&1 | tee build-macos/github-actions-build.log
+      - name: Read release version from CMake
+        id: release
+        shell: bash
+        run: |
+          python3 -X utf8 -c 'import sys; sys.path.insert(0, "tools"); from macos_release import project_version; print("version=" + project_version())' >> "$GITHUB_OUTPUT"
       - name: Save tested delivery and native results when explicitly requested
         if: ${{ success() && inputs.upload_artifacts }}
         # Official v7 tag resolved with git ls-remote on 2026-10-26.
@@ -65,9 +71,10 @@ jobs:
           compression-level: 0
           retention-days: 7
           path: |
-            dist-macos/Signal2M-v0.3.1-macOS-Universal.zip
-            dist-macos/Signal2M-v0.3.1-macOS-Universal.zip.sha256
+            dist-macos/Signal2M-v${{ steps.release.outputs.version }}-macOS-Universal.zip
+            dist-macos/Signal2M-v${{ steps.release.outputs.version }}-macOS-Universal.zip.sha256
             build-macos/native-test-results.json
+            build-macos/package-results.json
             build-macos/Testing/Temporary/LastTest.log
       - name: Save diagnostics even when the build or tests fail
         if: ${{ always() && inputs.upload_artifacts }}
